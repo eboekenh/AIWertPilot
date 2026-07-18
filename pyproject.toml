@@ -1,0 +1,65 @@
+[project]
+name = "de-ai-kb"
+version = "0.1.0"
+description = "Germany AI Knowledge Base — Foundation Release 1"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+license = { text = "Proprietary" }
+dependencies = [
+  "fastapi>=0.115",
+  "uvicorn[standard]>=0.32",
+  "pydantic>=2.9",
+  "pydantic-settings>=2.6",
+  "sqlalchemy>=2.0",
+  "alembic>=1.13",
+  "asyncpg>=0.30",
+  "psycopg[binary]>=3.2",
+  "pgvector>=0.3.6",
+  "httpx>=0.27",
+  "typer>=0.13",
+  "rich>=13.9",
+  "python-dateutil>=2.9",
+]
+
+[project.scripts]
+de-ai-kb = "de_ai_kb.cli.main:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/de_ai_kb"]
+
+[dependency-groups]
+dev = [
+  "pytest>=8.3",
+  "pytest-asyncio>=0.24",
+  "ruff>=0.7",
+  "mypy>=1.13",
+]
+
+[tool.ruff]
+line-length = 110
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.ruff.lint.per-file-ignores]
+# Verbatim SQL text copied from schema.sql; line length is intentionally
+# not reformatted so the migration stays a faithful, diffable reproduction.
+"migrations/versions/0001_baseline_schema.py" = ["E501"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+plugins = []
+disallow_untyped_defs = true
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
+testpaths = ["tests"]

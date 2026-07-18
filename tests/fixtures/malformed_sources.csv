@@ -1,0 +1,8 @@
+"source_key","title","publisher","source_type","tier","topics","geography","language","url","access_policy","refresh_days","review_status","notes"
+"GOOD_ROW_1","A Valid Source","Publisher A","official_statistics","A","adoption","DE","de","https://example.com/good1","metadata_only","90","discovery_verified","fine"
+"BAD_TIER","Bad Tier Source","Publisher B","official_statistics","Z","adoption","DE","de","https://example.com/bad-tier","metadata_only","90","discovery_verified","invalid tier"
+"BAD_ACCESS_POLICY","Bad Access Policy Source","Publisher C","official_statistics","A","adoption","DE","de","https://example.com/bad-access","nonexistent_policy","90","discovery_verified","invalid access_policy"
+"BAD_URL","Bad URL Source","Publisher D","official_statistics","A","adoption","DE","de","not-a-url","metadata_only","90","discovery_verified","invalid url"
+"BAD_REFRESH","Bad Refresh Source","Publisher E","official_statistics","A","adoption","DE","de","https://example.com/bad-refresh","metadata_only","0","discovery_verified","invalid refresh_days"
+"","Missing Key Source","Publisher F","official_statistics","A","adoption","DE","de","https://example.com/missing-key","metadata_only","90","discovery_verified","missing source_key"
+"GOOD_ROW_2","Another Valid Source","Publisher G","official_statistics","B","adoption","DE","de","https://example.com/good2","metadata_only","90","discovery_verified","fine"
