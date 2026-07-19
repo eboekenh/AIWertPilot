@@ -89,3 +89,42 @@
   Renaming the paginated repository method sidesteps the shadow; the
   service-layer method can safely stay named `list` since nothing after it
   in that class references the builtin.
+
+## Foundation Hardening Release 1.1 — Phase 1
+
+An independent security/correctness review of the merged Foundation
+Release 1 found that `PATCH /api/v1/sources/{id}` could set `status`,
+`rights_status`, and `access_policy` directly, bypassing the state
+machine and the rights-review workflow entirely, and that
+`POST /api/v1/sources` never created the two standard review items the
+CSV importer did. Phase 1 closes both:
+
+- `SourceUpdate` no longer accepts `status`/`rights_status`/`access_policy`;
+  unknown/removed fields return `422` (`extra="forbid"`).
+  `SourceRegistryService.update_source()` enforces the same restriction via
+  an explicit `EDITABLE_SOURCE_FIELDS` allowlist, so a direct service call
+  gets the same protection as the HTTP API — not just the Pydantic schema.
+- New `POST /api/v1/sources/{id}/transition` (`de-ai-kb sources
+  transition`) is now the only way to change `status`; invalid transitions
+  return `409`.
+- New `POST /api/v1/sources/{id}/block` (`de-ai-kb sources block`) exposes
+  the previously-unreachable takedown mechanism, with a mandatory
+  non-blank `reason`.
+- `SourceRegistryService.create_source()` now creates the two standard
+  review items itself, so every source-registration entry point
+  (API, CSV import, and any future one) gets them automatically — the
+  CSV importer no longer duplicates this call.
+- New `POST /api/v1/review-items/{id}/rights-decision` is the only way to
+  approve a `rights_review` item; it requires an explicit reviewed
+  `rights_status`/`access_policy` pair (validated by
+  `domain/rights_policy.py`), applies it to the source atomically in the
+  same transaction as the review decision, and is fully audited. The
+  generic decision endpoint now rejects an attempt to approve a
+  `rights_review` item with `422`.
+
+See `docs/RESEARCH_WORKFLOW.md` and `docs/RIGHTS_AND_CONTENT_POLICY.md`
+for the updated workflow, and the PR description for the full verification
+report this phase was scoped from. Deliberately out of scope for this
+phase: production auth, CI, ORM/index parity, general URL validation,
+freshness query validation, dedup redesign, quality scoring, provenance
+changes, object-storage hardening — tracked as separate follow-up phases.

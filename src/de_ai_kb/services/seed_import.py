@@ -19,7 +19,6 @@ from de_ai_kb.core.exceptions import DomainError
 from de_ai_kb.domain.enums import AccessPolicy, RightsStatus, SourceStatus
 from de_ai_kb.repositories.sources import SourceRepository
 from de_ai_kb.services.csv_rows import SeedSourceRow
-from de_ai_kb.services.review import ReviewService
 from de_ai_kb.services.source_registry import SourceRegistryService
 
 Outcome = Literal["inserted", "updated", "unchanged", "rejected"]
@@ -68,8 +67,11 @@ def _diff_fields(existing: Any, parsed: SeedSourceRow) -> dict[str, Any]:
         diff["topic_tags"] = parsed.topics
     if sorted(existing.geography_codes) != sorted(parsed.geography):
         diff["geography_codes"] = parsed.geography
-    if existing.access_policy != parsed.access_policy:
-        diff["access_policy"] = parsed.access_policy
+    # access_policy is deliberately NOT diffed here: it is a governed rights
+    # field (EDITABLE_SOURCE_FIELDS excludes it) that must change through an
+    # actual rights review, never by silently re-importing a CSV with a
+    # different value for an already-registered source. A changed CSV value
+    # for an existing source is simply not applied.
     if existing.refresh_interval_days != parsed.refresh_days:
         diff["refresh_interval_days"] = parsed.refresh_days
     if existing.original_url != parsed.url:
@@ -93,17 +95,13 @@ class SeedImportService:
                 try:
                     row = SeedSourceRow.from_csv_row(raw_row)
                 except (ValidationError, ValueError) as exc:
-                    reason = (
-                        _format_validation_error(exc) if isinstance(exc, ValidationError) else str(exc)
-                    )
+                    reason = _format_validation_error(exc) if isinstance(exc, ValidationError) else str(exc)
                     parsed_rows.append((i, raw_row, None, reason))
                     continue
                 parsed_rows.append((i, raw_row, row, None))
         return parsed_rows
 
-    async def import_csv(
-        self, file_path: Path, *, dry_run: bool, actor_id: str
-    ) -> SeedImportSummary:
+    async def import_csv(self, file_path: Path, *, dry_run: bool, actor_id: str) -> SeedImportSummary:
         summary = SeedImportSummary(dry_run=dry_run)
         parsed_rows = self._parse_rows(file_path)
         summary.total_rows = len(parsed_rows)
@@ -112,9 +110,7 @@ class SeedImportService:
             source_key = (raw_row or {}).get("source_key", "") if raw_row else ""
             if parsed is None:
                 summary.rejected += 1
-                summary.rows.append(
-                    RowResult(row_number, source_key, "rejected", reason=reject_reason)
-                )
+                summary.rows.append(RowResult(row_number, source_key, "rejected", reason=reject_reason))
                 continue
 
             if dry_run:
@@ -139,9 +135,14 @@ class SeedImportService:
                     repo = SourceRepository(session)
                     existing = await repo.get_by_source_key(parsed.source_key)
                     registry_service = SourceRegistryService(session)
-                    review_service = ReviewService(session)
 
                     if existing is None:
+                        # create_source() itself guarantees the two standard
+                        # review items (rights_review + content_review) in
+                        # the same transaction — see
+                        # SourceRegistryService.create_source. This is the
+                        # single place that invariant is enforced; the
+                        # importer does not duplicate it.
                         source = await registry_service.create_source(
                             source_key=parsed.source_key,
                             title=parsed.title,
@@ -159,15 +160,10 @@ class SeedImportService:
                             status=SourceStatus.REGISTERED,
                             actor_id=actor_id,
                         )
-                        created_items = await review_service.create_standard_source_review_items(
-                            source_id=source.id, actor_id=actor_id
-                        )
                         summary.inserted += 1
-                        summary.review_items_created += len(created_items)
+                        summary.review_items_created += 2
                         summary.rows.append(
-                            RowResult(
-                                row_number, parsed.source_key, "inserted", source_id=str(source.id)
-                            )
+                            RowResult(row_number, parsed.source_key, "inserted", source_id=str(source.id))
                         )
                     else:
                         diff = _diff_fields(existing, parsed)
@@ -185,14 +181,14 @@ class SeedImportService:
                             summary.unchanged += 1
                             summary.rows.append(
                                 RowResult(
-                                    row_number, parsed.source_key, "unchanged",
+                                    row_number,
+                                    parsed.source_key,
+                                    "unchanged",
                                     source_id=str(existing.id),
                                 )
                             )
             except DomainError as exc:
                 summary.rejected += 1
-                summary.rows.append(
-                    RowResult(row_number, parsed.source_key, "rejected", reason=exc.message)
-                )
+                summary.rows.append(RowResult(row_number, parsed.source_key, "rejected", reason=exc.message))
 
         return summary

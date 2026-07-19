@@ -3,19 +3,30 @@
 from __future__ import annotations
 
 import uuid
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from de_ai_kb.core.exceptions import InvalidStateTransitionError, NotFoundError
+from de_ai_kb.core.exceptions import (
+    InvalidStateTransitionError,
+    NotFoundError,
+    ValidationFailedError,
+)
 from de_ai_kb.db.models.ops import ReviewItem
+from de_ai_kb.db.models.sources import Source
 from de_ai_kb.domain.enums import (
     REVIEW_ITEM_STATUS_TRANSITIONS,
     REVIEW_TYPE_CONTENT,
     REVIEW_TYPE_RIGHTS,
+    AccessPolicy,
     ReviewItemStatus,
+    RightsStatus,
+    TdmOptOutStatus,
 )
+from de_ai_kb.domain.rights_policy import validate_rights_resolution
 from de_ai_kb.repositories.review import ReviewItemFilters, ReviewItemRepository
+from de_ai_kb.repositories.sources import SourceRepository
 from de_ai_kb.services.audit import AuditService
 
 
@@ -23,6 +34,7 @@ class ReviewService:
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
         self._repo = ReviewItemRepository(session)
+        self._source_repo = SourceRepository(session)
         self._audit = AuditService(session)
 
     async def create_standard_source_review_items(
@@ -50,7 +62,9 @@ class ReviewService:
                 entity_type="review_item",
                 entity_id=item.id,
                 after_state={
-                    "entity_type": "source", "entity_id": str(source_id), "review_type": review_type,
+                    "entity_type": "source",
+                    "entity_id": str(source_id),
+                    "review_type": review_type,
                 },
             )
             created.append(item)
@@ -109,6 +123,23 @@ class ReviewService:
         if item is None:
             raise NotFoundError(f"review_item {review_item_id} not found")
 
+        # A rights_review item can only be *approved* through the dedicated
+        # rights-decision workflow (resolve_rights_review), which requires
+        # explicit reviewed rights_status/access_policy values in the same
+        # transaction as the decision. Approving it here would leave
+        # review_items.status="approved" with the source's rights fields
+        # untouched — an inconsistent "reviewed but nothing was actually
+        # decided" state. Every other transition (reject/needs_changes/
+        # cancel/in_progress) carries no rights implication and is
+        # unaffected — non-rights review items always use this method.
+        if item.review_type == REVIEW_TYPE_RIGHTS and new_status == ReviewItemStatus.APPROVED:
+            raise ValidationFailedError(
+                "rights_review items must be approved via "
+                "POST /api/v1/review-items/{id}/rights-decision with explicit "
+                "reviewed rights_status/access_policy values",
+                details={"review_item_id": str(review_item_id)},
+            )
+
         current = ReviewItemStatus(item.status)
         allowed = REVIEW_ITEM_STATUS_TRANSITIONS.get(current, set())
         if new_status not in allowed:
@@ -126,8 +157,6 @@ class ReviewService:
             ReviewItemStatus.NEEDS_CHANGES,
             ReviewItemStatus.CANCELLED,
         ):
-            from datetime import UTC, datetime
-
             item.decided_at = datetime.now(UTC)
 
         await self._session.flush()
@@ -141,6 +170,107 @@ class ReviewService:
             after_state={"status": item.status, "decision_reason": item.decision_reason},
         )
         return item
+
+    async def resolve_rights_review(
+        self,
+        *,
+        review_item_id: uuid.UUID,
+        rights_status: RightsStatus,
+        access_policy: AccessPolicy,
+        decision_reason: str,
+        tdm_opt_out_status: TdmOptOutStatus | None,
+        licence_name: str | None,
+        licence_url: str | None,
+        actor_id: str,
+    ) -> tuple[ReviewItem, Source]:
+        """Approve a rights_review item and apply its outcome to the source's
+        actual rights fields, atomically (same session/transaction, no
+        commit until the caller's request-scoped session commits).
+
+        Validation happens entirely before any mutation, so a rejected
+        rights/access combination or an invalid state transition leaves
+        both the review item and the source completely untouched.
+        """
+        item = await self._repo.get_by_id(review_item_id)
+        if item is None:
+            raise NotFoundError(f"review_item {review_item_id} not found")
+
+        if item.review_type != REVIEW_TYPE_RIGHTS:
+            raise ValidationFailedError(
+                f"review_item {review_item_id} is not a rights_review item "
+                f"(review_type={item.review_type!r})",
+                details={"review_item_id": str(review_item_id)},
+            )
+
+        current = ReviewItemStatus(item.status)
+        allowed = REVIEW_ITEM_STATUS_TRANSITIONS.get(current, set())
+        if ReviewItemStatus.APPROVED not in allowed:
+            raise InvalidStateTransitionError(
+                f"review_item {review_item_id}: cannot transition from {current.value} to approved",
+                details={"from": current.value, "to": "approved"},
+            )
+
+        try:
+            validate_rights_resolution(rights_status, access_policy)
+        except ValueError as exc:
+            raise ValidationFailedError(str(exc), details={"review_item_id": str(review_item_id)}) from exc
+
+        source = await self._source_repo.get_by_id(item.entity_id)
+        if source is None:
+            raise NotFoundError(f"source {item.entity_id} not found")
+
+        # --- validation complete; only mutation from here on ---
+
+        before_item = {"status": item.status, "decision_reason": item.decision_reason}
+        item.status = ReviewItemStatus.APPROVED.value
+        item.decision_reason = decision_reason
+        item.decided_at = datetime.now(UTC)
+
+        before_source = {
+            "rights_status": source.rights_status,
+            "access_policy": source.access_policy,
+            "tdm_opt_out_status": source.tdm_opt_out_status,
+            "licence_name": source.licence_name,
+            "licence_url": source.licence_url,
+        }
+        source.rights_status = rights_status.value
+        source.access_policy = access_policy.value
+        if tdm_opt_out_status is not None:
+            source.tdm_opt_out_status = tdm_opt_out_status.value
+        if licence_name is not None:
+            source.licence_name = licence_name
+        if licence_url is not None:
+            source.licence_url = licence_url
+
+        await self._session.flush()
+
+        self._audit.record(
+            actor_type="api_key",
+            actor_id=actor_id,
+            action="review_item.rights_decision",
+            entity_type="review_item",
+            entity_id=item.id,
+            before_state=before_item,
+            after_state={"status": item.status, "decision_reason": item.decision_reason},
+        )
+        self._audit.record(
+            actor_type="api_key",
+            actor_id=actor_id,
+            action="source.rights_reviewed",
+            entity_type="source",
+            entity_id=source.id,
+            before_state={k: (v or "") for k, v in before_source.items()},
+            after_state={
+                "rights_status": source.rights_status,
+                "access_policy": source.access_policy,
+                "tdm_opt_out_status": source.tdm_opt_out_status,
+                "licence_name": source.licence_name or "",
+                "licence_url": source.licence_url or "",
+                "review_item_id": str(item.id),
+            },
+        )
+
+        return item, source
 
     async def list(
         self, *, filters: ReviewItemFilters, limit: int, offset: int

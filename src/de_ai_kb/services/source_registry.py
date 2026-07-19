@@ -17,6 +17,7 @@ from de_ai_kb.core.exceptions import (
     DuplicateSourceError,
     InvalidStateTransitionError,
     NotFoundError,
+    ValidationFailedError,
 )
 from de_ai_kb.db.models.sources import Source
 from de_ai_kb.domain.enums import (
@@ -28,6 +29,18 @@ from de_ai_kb.domain.enums import (
 from de_ai_kb.domain.url import canonicalize_url
 from de_ai_kb.repositories.sources import SourceFilters, SourceRepository
 from de_ai_kb.services.audit import AuditService
+from de_ai_kb.services.review import ReviewService
+
+# Fields a generic PATCH may edit. Deliberately excludes status,
+# rights_status, access_policy, tdm_opt_out_status, and licence_*: those are
+# governed invariants with their own dedicated workflows (transition_status,
+# block_source, ReviewService.resolve_rights_review), not free-form
+# metadata. Enforced here — not just at the Pydantic/API layer — so a
+# direct service call (from a future CLI command, script, or test) gets the
+# same protection as the HTTP API.
+EDITABLE_SOURCE_FIELDS: frozenset[str] = frozenset(
+    {"title", "publisher", "tier", "topic_tags", "refresh_interval_days", "notes"}
+)
 
 
 class SourceRegistryService:
@@ -35,6 +48,7 @@ class SourceRegistryService:
         self._session = session
         self._repo = SourceRepository(session)
         self._audit = AuditService(session)
+        self._review = ReviewService(session)
 
     async def create_source(
         self,
@@ -99,11 +113,25 @@ class SourceRegistryService:
             entity_id=source.id,
             after_state={"source_key": source_key, "canonical_url": canonical_url, "status": source.status},
         )
+
+        # Every newly registered source, regardless of caller (API, CSV
+        # import, or any future entry point), gets exactly one open
+        # rights_review and one open content_review item. Centralized here
+        # so the invariant cannot be forgotten by a new caller — see
+        # docs/RESEARCH_WORKFLOW.md.
+        await self._review.create_standard_source_review_items(source_id=source.id, actor_id=actor_id)
+
         return source
 
-    async def update_source(
-        self, *, source_id: uuid.UUID, updates: dict[str, Any], actor_id: str
-    ) -> Source:
+    async def update_source(self, *, source_id: uuid.UUID, updates: dict[str, Any], actor_id: str) -> Source:
+        unknown_or_protected = set(updates) - EDITABLE_SOURCE_FIELDS
+        if unknown_or_protected:
+            raise ValidationFailedError(
+                "update_source received field(s) that are not generic editable metadata; "
+                "use the transition/block/rights-decision workflows instead",
+                details={"rejected_fields": sorted(unknown_or_protected)},
+            )
+
         source = await self._repo.get_by_id(source_id)
         if source is None:
             raise NotFoundError(f"source {source_id} not found")
@@ -156,15 +184,16 @@ class SourceRegistryService:
         """Takedown/block mechanism. The reason is mandatory and always
         retained in the audit trail, per RESEARCH_PROTOCOL.md §10."""
         if not reason.strip():
-            raise ValueError("a block reason is required")
+            raise ValidationFailedError("a non-blank block reason is required")
         return await self.transition_status(
             source_id=source_id, new_status=SourceStatus.BLOCKED, reason=reason, actor_id=actor_id
         )
 
-    async def list(
-        self, *, filters: SourceFilters, limit: int, offset: int
-    ) -> tuple[list[Source], int]:
+    async def list(self, *, filters: SourceFilters, limit: int, offset: int) -> tuple[list[Source], int]:
         return await self._repo.list_page(filters=filters, limit=limit, offset=offset)
 
     async def get_by_id(self, source_id: uuid.UUID) -> Source | None:
         return await self._repo.get_by_id(source_id)
+
+    async def get_by_source_key(self, source_key: str) -> Source | None:
+        return await self._repo.get_by_source_key(source_key)

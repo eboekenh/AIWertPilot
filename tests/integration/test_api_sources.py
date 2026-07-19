@@ -93,9 +93,7 @@ async def test_list_filter_by_tier_and_publisher(api_client: AsyncClient, dev_ap
 
 
 async def test_list_filter_by_topic(api_client: AsyncClient, dev_api_key: str) -> None:
-    await _create_source(
-        api_client, dev_api_key, source_key="TOPIC_A", topic_tags=["adoption", "barriers"]
-    )
+    await _create_source(api_client, dev_api_key, source_key="TOPIC_A", topic_tags=["adoption", "barriers"])
     await _create_source(
         api_client,
         dev_api_key,
@@ -129,3 +127,141 @@ async def test_freshness_endpoint_reports_unknown_for_never_verified(
     body = response.json()
     assert any(item["source_key"] == "API_SOURCE" for item in body)
     assert all(item["freshness_state"] == "unknown" for item in body)
+
+
+@pytest.mark.parametrize(
+    "field_and_value",
+    [
+        {"status": "published"},
+        {"rights_status": "reviewed_allowed"},
+        {"access_policy": "full_text_allowed"},
+    ],
+)
+async def test_patch_source_rejects_lifecycle_and_rights_fields(
+    api_client: AsyncClient, dev_api_key: str, field_and_value: dict
+) -> None:
+    created = await _create_source(api_client, dev_api_key)
+    response = await api_client.patch(
+        f"/api/v1/sources/{created['id']}", json=field_and_value, headers={"X-API-Key": dev_api_key}
+    )
+    assert response.status_code == 422
+
+    unchanged = await api_client.get(f"/api/v1/sources/{created['id']}")
+    assert unchanged.json()["status"] == "registered"
+    assert unchanged.json()["rights_status"] == "needs_review"
+    assert unchanged.json()["access_policy"] == "metadata_only"
+
+
+async def test_patch_source_rejects_unknown_field(api_client: AsyncClient, dev_api_key: str) -> None:
+    created = await _create_source(api_client, dev_api_key)
+    response = await api_client.patch(
+        f"/api/v1/sources/{created['id']}",
+        json={"totally_unknown_field": "x"},
+        headers={"X-API-Key": dev_api_key},
+    )
+    assert response.status_code == 422
+
+
+async def test_transition_endpoint_valid_transition_succeeds(
+    api_client: AsyncClient, dev_api_key: str
+) -> None:
+    created = await _create_source(api_client, dev_api_key, source_key="TRANSITION_VALID")
+    response = await api_client.post(
+        f"/api/v1/sources/{created['id']}/transition",
+        json={"new_status": "fetched", "reason": "content retrieved"},
+        headers={"X-API-Key": dev_api_key},
+    )
+    assert response.status_code == 200
+    assert response.json()["status"] == "fetched"
+
+
+async def test_transition_endpoint_invalid_transition_returns_409(
+    api_client: AsyncClient, dev_api_key: str
+) -> None:
+    created = await _create_source(api_client, dev_api_key, source_key="TRANSITION_INVALID")
+    response = await api_client.post(
+        f"/api/v1/sources/{created['id']}/transition",
+        json={"new_status": "published"},  # registered -> published is not allowed directly
+        headers={"X-API-Key": dev_api_key},
+    )
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "invalid_state_transition"
+
+
+async def test_transition_endpoint_requires_api_key(api_client: AsyncClient, dev_api_key: str) -> None:
+    created = await _create_source(api_client, dev_api_key, source_key="TRANSITION_AUTH")
+    response = await api_client.post(
+        f"/api/v1/sources/{created['id']}/transition", json={"new_status": "fetched"}
+    )
+    assert response.status_code == 401
+
+
+async def test_transition_endpoint_creates_audit_event(api_client: AsyncClient, dev_api_key: str) -> None:
+    from de_ai_kb.core.config import get_settings
+    from de_ai_kb.db.session import get_sessionmaker
+    from de_ai_kb.repositories.audit import AuditEventRepository
+
+    created = await _create_source(api_client, dev_api_key, source_key="TRANSITION_AUDIT")
+    response = await api_client.post(
+        f"/api/v1/sources/{created['id']}/transition",
+        json={"new_status": "fetched", "reason": "audited"},
+        headers={"X-API-Key": dev_api_key},
+    )
+    assert response.status_code == 200
+
+    session_factory = get_sessionmaker(get_settings().test_database_url)
+    async with session_factory() as session:
+        import uuid
+
+        repo = AuditEventRepository(session)
+        events = await repo.list_for_entity(entity_type="source", entity_id=uuid.UUID(created["id"]))
+    assert any(e.action == "source.status_transition" for e in events)
+
+
+async def test_block_endpoint_missing_reason_returns_422(api_client: AsyncClient, dev_api_key: str) -> None:
+    created = await _create_source(api_client, dev_api_key, source_key="BLOCK_MISSING_REASON")
+    response = await api_client.post(
+        f"/api/v1/sources/{created['id']}/block", json={}, headers={"X-API-Key": dev_api_key}
+    )
+    assert response.status_code == 422
+
+
+async def test_block_endpoint_blank_reason_returns_422(api_client: AsyncClient, dev_api_key: str) -> None:
+    created = await _create_source(api_client, dev_api_key, source_key="BLOCK_BLANK_REASON")
+    response = await api_client.post(
+        f"/api/v1/sources/{created['id']}/block",
+        json={"reason": "   "},
+        headers={"X-API-Key": dev_api_key},
+    )
+    assert response.status_code == 422
+
+
+async def test_block_endpoint_with_reason_blocks_and_audits(
+    api_client: AsyncClient, dev_api_key: str
+) -> None:
+    from de_ai_kb.core.config import get_settings
+    from de_ai_kb.db.session import get_sessionmaker
+    from de_ai_kb.repositories.audit import AuditEventRepository
+
+    created = await _create_source(api_client, dev_api_key, source_key="BLOCK_VALID")
+    response = await api_client.post(
+        f"/api/v1/sources/{created['id']}/block",
+        json={"reason": "takedown request from publisher"},
+        headers={"X-API-Key": dev_api_key},
+    )
+    assert response.status_code == 200
+    assert response.json()["status"] == "blocked"
+
+    session_factory = get_sessionmaker(get_settings().test_database_url)
+    async with session_factory() as session:
+        import uuid
+
+        repo = AuditEventRepository(session)
+        events = await repo.list_for_entity(entity_type="source", entity_id=uuid.UUID(created["id"]))
+    assert any(e.action == "source.status_transition" for e in events)
+
+
+async def test_block_endpoint_requires_api_key(api_client: AsyncClient, dev_api_key: str) -> None:
+    created = await _create_source(api_client, dev_api_key, source_key="BLOCK_AUTH")
+    response = await api_client.post(f"/api/v1/sources/{created['id']}/block", json={"reason": "x"})
+    assert response.status_code == 401

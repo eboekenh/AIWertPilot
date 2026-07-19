@@ -1,4 +1,6 @@
-"""GET /api/v1/review-items, POST /api/v1/review-items/{id}/decision."""
+"""GET /api/v1/review-items, POST /api/v1/review-items/{id}/decision,
+POST /api/v1/review-items/{id}/rights-decision.
+"""
 
 from __future__ import annotations
 
@@ -8,7 +10,13 @@ from fastapi import APIRouter, Query
 
 from de_ai_kb.api.deps import ApiKeyActorDep, SessionDep
 from de_ai_kb.api.schemas.common import Page
-from de_ai_kb.api.schemas.review_items import ReviewDecisionRequest, ReviewItemRead
+from de_ai_kb.api.schemas.review_items import (
+    ReviewDecisionRequest,
+    ReviewItemRead,
+    RightsReviewDecisionRequest,
+    RightsReviewDecisionResult,
+)
+from de_ai_kb.api.schemas.sources import SourceRead
 from de_ai_kb.repositories.review import ReviewItemFilters
 from de_ai_kb.services.review import ReviewService
 
@@ -39,6 +47,9 @@ async def decide_review_item(
     session: SessionDep,
     actor: ApiKeyActorDep,
 ) -> ReviewItemRead:
+    """Generic decision workflow for non-rights review items (content_review,
+    dedup_candidate, and non-approval outcomes of rights_review). Approving
+    a rights_review item here is rejected — see /rights-decision."""
     service = ReviewService(session)
     item = await service.decide(
         review_item_id=review_item_id,
@@ -47,3 +58,30 @@ async def decide_review_item(
         actor_id=actor,
     )
     return ReviewItemRead.model_validate(item)
+
+
+@router.post("/{review_item_id}/rights-decision", response_model=RightsReviewDecisionResult)
+async def resolve_rights_review(
+    review_item_id: uuid.UUID,
+    payload: RightsReviewDecisionRequest,
+    session: SessionDep,
+    actor: ApiKeyActorDep,
+) -> RightsReviewDecisionResult:
+    """Approve a rights_review item with an explicit reviewed rights_status/
+    access_policy outcome, applied to the source atomically in the same
+    transaction as the review decision. Both the review-item update and the
+    source policy update are audited."""
+    service = ReviewService(session)
+    item, source = await service.resolve_rights_review(
+        review_item_id=review_item_id,
+        rights_status=payload.rights_status,
+        access_policy=payload.access_policy,
+        decision_reason=payload.decision_reason,
+        tdm_opt_out_status=payload.tdm_opt_out_status,
+        licence_name=payload.licence_name,
+        licence_url=payload.licence_url,
+        actor_id=actor,
+    )
+    return RightsReviewDecisionResult(
+        review_item=ReviewItemRead.model_validate(item), source=SourceRead.model_validate(source)
+    )

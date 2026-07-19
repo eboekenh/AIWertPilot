@@ -21,11 +21,26 @@ still decide.
   that exposes no `update()`), so a retention/rights decision recorded at
   fetch time can't be quietly changed after the fact — a *new* snapshot is
   required to reflect a changed source.
-- **Takedown/block mechanism.** `SourceRegistryService.block_source(...)`
-  requires a non-empty `reason` (raises `ValueError` otherwise) and
-  transitions `sources.status` to `blocked` via the same audited state-
-  transition path as any other status change — the reason lands in
+- **Takedown/block mechanism.** `POST /api/v1/sources/{id}/block` (or
+  `de-ai-kb sources block <source-key-or-id> --reason ...`) calls
+  `SourceRegistryService.block_source(...)`, which requires a non-blank
+  `reason` (a whitespace-only reason is rejected at both the request-schema
+  and service layer, raising `ValidationFailedError` — a proper typed
+  domain error, not a bare `ValueError`, so it surfaces as a clean `422`)
+  and transitions `sources.status` to `blocked` via the same audited
+  state-transition path as any other status change — the reason lands in
   `audit_events.after_state`, never silently discarded.
+- **Lifecycle and rights fields are not editable through the generic PATCH
+  route.** `PATCH /api/v1/sources/{id}` only edits metadata (`title`,
+  `publisher`, `tier`, `topic_tags`, `refresh_interval_days`, `notes`).
+  `status`, `rights_status`, and `access_policy` can only change through
+  `POST /api/v1/sources/{id}/transition`,
+  `POST /api/v1/sources/{id}/block`, and
+  `POST /api/v1/review-items/{id}/rights-decision` respectively.
+  `SourceRegistryService.update_source()` enforces an explicit allowlist of
+  editable fields itself (`EDITABLE_SOURCE_FIELDS`), so this protection
+  holds even for a direct service call that bypasses the API/Pydantic
+  layer entirely — not just for HTTP requests.
 - **No personal data collected.** The domain model has no field for
   contact details, and nothing in this release ingests or stores personal
   data — `organizations`/`training_providers` model companies, not
@@ -52,7 +67,13 @@ still decide.
   from `metadata_only` to `short_evidence` or `full_text_allowed` — this
   requires a documented rights basis (explicit licence, public-domain
   status, owner permission) that only a human reviewer can establish and
-  record via the review-item decision, not the API/CLI defaults.
+  record via `POST /api/v1/review-items/{id}/rights-decision`, never via
+  the generic PATCH route or the API/CLI defaults. The reviewed
+  `rights_status`/`access_policy` pair is validated before it is applied
+  (`domain/rights_policy.py`) — e.g. a `blocked` rights outcome can never
+  be paired with `short_evidence` or `full_text_allowed` — but the
+  underlying legal judgment of *which* outcome is correct remains the
+  reviewer's, not the software's.
 
 ## Escalation cases to flag for legal review
 
