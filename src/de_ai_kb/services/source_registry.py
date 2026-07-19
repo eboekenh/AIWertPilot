@@ -26,6 +26,7 @@ from de_ai_kb.domain.enums import (
     RightsStatus,
     SourceStatus,
 )
+from de_ai_kb.domain.rights_policy import validate_rights_resolution
 from de_ai_kb.domain.url import canonicalize_url
 from de_ai_kb.repositories.sources import SourceFilters, SourceRepository
 from de_ai_kb.services.audit import AuditService
@@ -199,14 +200,24 @@ class SourceRegistryService:
         if source is None:
             raise NotFoundError(f"source {source_id} not found")
 
-        if "canonical_url" in updates and updates["canonical_url"] != source.canonical_url:
-            new_publisher = updates.get("publisher", source.publisher)
-            conflicting = await self._repo.get_by_canonical_url(updates["canonical_url"])
-            conflict = [s for s in conflicting if s.id != source_id and s.publisher == new_publisher]
+        # schema.sql's UNIQUE constraint is on the (canonical_url,
+        # publisher) *pair*, so a conflict can be introduced by changing
+        # either field alone — e.g. two sources already sharing a
+        # canonical_url under different publishers, where a publisher-only
+        # edit to one of them collides with the other. Must check the
+        # effective pair whenever either field is being updated, not only
+        # when canonical_url changes, or a publisher-only rename could slip
+        # past this check and hit the DB's UNIQUE constraint as a raw
+        # IntegrityError instead of a clean DuplicateSourceError.
+        if "canonical_url" in updates or "publisher" in updates:
+            effective_canonical_url = updates.get("canonical_url", source.canonical_url)
+            effective_publisher = updates.get("publisher", source.publisher)
+            conflicting = await self._repo.get_by_canonical_url(effective_canonical_url)
+            conflict = [s for s in conflicting if s.id != source_id and s.publisher == effective_publisher]
             if conflict:
                 raise DuplicateSourceError(
-                    f"canonical_url {updates['canonical_url']!r} already registered for "
-                    f"publisher {new_publisher!r}",
+                    f"canonical_url {effective_canonical_url!r} already registered for "
+                    f"publisher {effective_publisher!r}",
                     details={"existing_id": str(conflict[0].id)},
                 )
 
@@ -290,6 +301,31 @@ class SourceRegistryService:
                     "approved rights_review and a valid, non-blocked rights outcome",
                     details={"to": new_status.value},
                 )
+
+            # is_rights_review_approved()/the non-blocked check above only
+            # look at rights_status in isolation — they would not catch a
+            # stored access_policy that is inconsistent with it (e.g.
+            # rights_status=reviewed_allowed but access_policy=blocked or
+            # =unknown). resolve_rights_review() always writes a validated,
+            # consistent pair, but the gate re-validates the pair actually
+            # stored on the source rather than trusting that nothing else
+            # could ever produce an inconsistent one — defense in depth, the
+            # same posture as everywhere else governed fields are checked in
+            # this service.
+            try:
+                validate_rights_resolution(
+                    RightsStatus(source.rights_status), AccessPolicy(source.access_policy)
+                )
+            except ValueError as exc:
+                raise ValidationFailedError(
+                    f"source {source.id}: cannot transition to {new_status.value} — the stored "
+                    f"rights_status/access_policy pair is not a valid reviewed outcome: {exc}",
+                    details={
+                        "to": new_status.value,
+                        "rights_status": source.rights_status,
+                        "access_policy": source.access_policy,
+                    },
+                ) from exc
 
         if new_status in (SourceStatus.APPROVED, SourceStatus.PUBLISHED):
             content_approved = await self._review.is_content_review_approved(source_id=source.id)

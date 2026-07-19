@@ -9,6 +9,7 @@ from de_ai_kb.core.exceptions import (
 )
 from de_ai_kb.domain.enums import AccessPolicy, RightsStatus, SourceStatus
 from de_ai_kb.repositories.audit import AuditEventRepository
+from de_ai_kb.repositories.sources import SourceRepository
 from de_ai_kb.services.review import ReviewService
 from de_ai_kb.services.source_registry import SourceRegistryService
 
@@ -339,6 +340,103 @@ async def test_transition_to_fetched_succeeds_after_rights_review_approved(db_se
         actor_type="api_key",
     )
     assert updated.status == SourceStatus.FETCHED.value
+
+
+async def _force_inconsistent_access_policy(
+    session: AsyncSession, source: object, access_policy: AccessPolicy
+) -> None:
+    """Directly overwrites access_policy on the stored source row, bypassing
+    ReviewService.resolve_rights_review's validation entirely. The normal
+    application flow can never produce an inconsistent rights_status/
+    access_policy pair (resolve_rights_review always validates before
+    writing), so this simulates a row that somehow ended up inconsistent
+    anyway (a future bug, a manual data fix, a migration) — the gate must
+    still catch it independently rather than trusting the pair blindly."""
+    repo = SourceRepository(session)
+    stored = await repo.get_by_id(source.id)  # type: ignore[attr-defined]
+    assert stored is not None
+    stored.access_policy = access_policy.value
+    await session.flush()
+
+
+async def test_transition_to_fetched_rejects_reviewed_allowed_with_blocked_access_policy(
+    db_session: AsyncSession,
+) -> None:
+    source = await _make_source(db_session, source_key="GATE_INCONSISTENT_BLOCKED")
+    await db_session.commit()
+    await _approve_rights_review(
+        db_session,
+        source,
+        rights_status=RightsStatus.REVIEWED_ALLOWED,
+        access_policy=AccessPolicy.SHORT_EVIDENCE,
+    )
+    await _force_inconsistent_access_policy(db_session, source, AccessPolicy.BLOCKED)
+    await db_session.commit()
+
+    service = SourceRegistryService(db_session)
+    with pytest.raises(ValidationFailedError):
+        await service.transition_status(
+            source_id=source.id,
+            new_status=SourceStatus.FETCHED,
+            reason="attempt",
+            actor_id="test",
+            actor_type="api_key",
+        )
+
+    refreshed = await service.get_by_id(source.id)
+    assert refreshed is not None
+    assert refreshed.status == SourceStatus.REGISTERED.value
+
+
+async def test_transition_to_fetched_rejects_reviewed_restricted_with_full_text_allowed(
+    db_session: AsyncSession,
+) -> None:
+    source = await _make_source(db_session, source_key="GATE_INCONSISTENT_RESTRICTED")
+    await db_session.commit()
+    await _approve_rights_review(
+        db_session,
+        source,
+        rights_status=RightsStatus.REVIEWED_RESTRICTED,
+        access_policy=AccessPolicy.SHORT_EVIDENCE,
+    )
+    await _force_inconsistent_access_policy(db_session, source, AccessPolicy.FULL_TEXT_ALLOWED)
+    await db_session.commit()
+
+    service = SourceRegistryService(db_session)
+    with pytest.raises(ValidationFailedError):
+        await service.transition_status(
+            source_id=source.id,
+            new_status=SourceStatus.FETCHED,
+            reason="attempt",
+            actor_id="test",
+            actor_type="api_key",
+        )
+
+    refreshed = await service.get_by_id(source.id)
+    assert refreshed is not None
+    assert refreshed.status == SourceStatus.REGISTERED.value
+
+
+async def test_transition_to_fetched_rejects_unknown_access_policy(db_session: AsyncSession) -> None:
+    source = await _make_source(db_session, source_key="GATE_UNKNOWN_ACCESS_POLICY")
+    await db_session.commit()
+    await _approve_rights_review(db_session, source)
+    await _force_inconsistent_access_policy(db_session, source, AccessPolicy.UNKNOWN)
+    await db_session.commit()
+
+    service = SourceRegistryService(db_session)
+    with pytest.raises(ValidationFailedError):
+        await service.transition_status(
+            source_id=source.id,
+            new_status=SourceStatus.FETCHED,
+            reason="attempt",
+            actor_id="test",
+            actor_type="api_key",
+        )
+
+    refreshed = await service.get_by_id(source.id)
+    assert refreshed is not None
+    assert refreshed.status == SourceStatus.REGISTERED.value
 
 
 async def test_transition_to_approved_requires_content_review_approved(db_session: AsyncSession) -> None:

@@ -98,16 +98,24 @@ async def _predict_insert_conflict(repo: SourceRepository, parsed: SeedSourceRow
 
 async def _predict_update_conflict(repo: SourceRepository, existing: Any, diff: dict[str, Any]) -> str | None:
     """Mirror SourceRegistryService.update_source_from_seed's duplicate
-    check for a canonical_url change, so a dry-run "updated" prediction
-    never disagrees with what the real import actually does."""
-    if "canonical_url" not in diff:
+    check, so a dry-run "updated" prediction never disagrees with what the
+    real import actually does. schema.sql's UNIQUE constraint is on the
+    (canonical_url, publisher) *pair*, so a conflict can be introduced by
+    changing either field alone — e.g. two sources already sharing a
+    canonical_url under different publishers, where a publisher-only edit
+    to one of them collides with the other. Must check the effective pair
+    whenever either field is in the diff, not only when canonical_url is."""
+    if "canonical_url" not in diff and "publisher" not in diff:
         return None
-    new_canonical_url = diff["canonical_url"]
-    new_publisher = diff.get("publisher", existing.publisher)
-    candidates = await repo.get_by_canonical_url(new_canonical_url)
-    conflict = [s for s in candidates if s.id != existing.id and s.publisher == new_publisher]
+    effective_canonical_url = diff.get("canonical_url", existing.canonical_url)
+    effective_publisher = diff.get("publisher", existing.publisher)
+    candidates = await repo.get_by_canonical_url(effective_canonical_url)
+    conflict = [s for s in candidates if s.id != existing.id and s.publisher == effective_publisher]
     if conflict:
-        return f"canonical_url {new_canonical_url!r} already registered for publisher {new_publisher!r}"
+        return (
+            f"canonical_url {effective_canonical_url!r} already registered for "
+            f"publisher {effective_publisher!r}"
+        )
     return None
 
 

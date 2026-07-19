@@ -227,6 +227,51 @@ async def test_url_change_conflicting_with_another_source_is_rejected_consistent
     assert source_a.original_url == "https://example.com/a"
 
 
+async def test_publisher_only_change_creating_url_publisher_conflict_is_rejected_consistently(
+    test_session_factory: async_sessionmaker[AsyncSession], clean_db: None, tmp_path: Path
+) -> None:
+    """Two sources already share a canonical_url under different
+    publishers (allowed — schema.sql's UNIQUE is on the pair, not the URL
+    alone). A seed update that changes only SOURCE_A's publisher to match
+    SOURCE_B's would collide with SOURCE_B's (canonical_url, publisher)
+    pair even though the URL itself never changes — this must be predicted
+    in dry-run and rejected cleanly (never a raw IntegrityError) in the
+    real import, leaving SOURCE_A's row untouched."""
+    service = SeedImportService(test_session_factory)
+    initial_csv = _write_csv(
+        tmp_path / "initial.csv",
+        _row(source_key="SOURCE_A", url="https://example.com/shared", publisher="Publisher A"),
+        _row(source_key="SOURCE_B", url="https://example.com/shared", publisher="Publisher B"),
+    )
+    await service.import_csv(initial_csv, dry_run=False, actor_id="test")
+
+    conflicting_csv = _write_csv(
+        tmp_path / "conflicting.csv",
+        _row(source_key="SOURCE_A", url="https://example.com/shared", publisher="Publisher B"),
+        _row(source_key="SOURCE_B", url="https://example.com/shared", publisher="Publisher B"),
+    )
+    dry_run = await service.import_csv(conflicting_csv, dry_run=True, actor_id="test")
+    a_dry_row = next(r for r in dry_run.rows if r.source_key == "SOURCE_A")
+    assert a_dry_row.outcome == "rejected"
+    assert a_dry_row.reason is not None and "Publisher B" in a_dry_row.reason
+
+    real_run = await service.import_csv(conflicting_csv, dry_run=False, actor_id="test")
+    a_real_row = next(r for r in real_run.rows if r.source_key == "SOURCE_A")
+    assert a_real_row.outcome == "rejected"
+    # A DomainError (DuplicateSourceError) always carries a human-readable
+    # .message, which RowResult.reason is populated from — proving the
+    # `except DomainError` branch handled this cleanly rather than a raw
+    # SQLAlchemy IntegrityError propagating out of import_csv().
+    assert a_real_row.reason is not None and "Publisher B" in a_real_row.reason
+    assert a_dry_row.reason == a_real_row.reason
+
+    async with test_session_factory() as session:
+        source_a = await SourceRepository(session).get_by_source_key("SOURCE_A")
+    assert source_a is not None
+    assert source_a.publisher == "Publisher A"
+    assert source_a.canonical_url == "https://example.com/shared"
+
+
 async def test_access_policy_csv_change_never_overwrites_a_completed_rights_review(
     test_session_factory: async_sessionmaker[AsyncSession], clean_db: None, tmp_path: Path
 ) -> None:
