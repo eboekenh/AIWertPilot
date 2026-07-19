@@ -18,7 +18,7 @@ from de_ai_kb.api.schemas.sources import (
     SourceUpdate,
 )
 from de_ai_kb.core.exceptions import NotFoundError
-from de_ai_kb.domain.enums import FreshnessState, SourceStatus
+from de_ai_kb.domain.enums import FreshnessState
 from de_ai_kb.domain.freshness import compute_freshness_state
 from de_ai_kb.repositories.sources import SourceFilters
 from de_ai_kb.services.source_registry import SourceRegistryService
@@ -87,12 +87,10 @@ async def create_source(payload: SourceCreate, session: SessionDep, actor: ApiKe
         geography_codes=payload.geography_codes,
         jurisdiction_codes=payload.jurisdiction_codes,
         topic_tags=payload.topic_tags,
-        access_policy=payload.access_policy,
-        rights_status=payload.rights_status,
         refresh_interval_days=payload.refresh_interval_days,
         notes=payload.notes,
-        status=SourceStatus.REGISTERED,
         actor_id=actor,
+        actor_type="api_key",
     )
     return SourceRead.model_validate(source)
 
@@ -118,7 +116,9 @@ async def update_source(
     tier = updates.get("tier")
     if tier is not None:
         updates["tier"] = tier.value if hasattr(tier, "value") else tier
-    source = await service.update_source(source_id=source_id, updates=updates, actor_id=actor)
+    source = await service.update_source(
+        source_id=source_id, updates=updates, actor_id=actor, actor_type="api_key"
+    )
     return SourceRead.model_validate(source)
 
 
@@ -126,12 +126,18 @@ async def update_source(
 async def transition_source(
     source_id: uuid.UUID, payload: SourceTransitionRequest, session: SessionDep, actor: ApiKeyActorDep
 ) -> SourceRead:
-    """The only supported way to change a source's lifecycle status. Invalid
-    transitions return 409 via InvalidStateTransitionError; every successful
-    transition is audited in the same transaction."""
+    """The only supported way to change a source's lifecycle status, except
+    for blocked — SourceTransitionRequest rejects new_status=blocked and
+    directs the caller to /block. Invalid transitions return 409 via
+    InvalidStateTransitionError; every successful transition is audited in
+    the same transaction."""
     service = SourceRegistryService(session)
     source = await service.transition_status(
-        source_id=source_id, new_status=payload.new_status, reason=payload.reason, actor_id=actor
+        source_id=source_id,
+        new_status=payload.new_status,
+        reason=payload.reason,
+        actor_id=actor,
+        actor_type="api_key",
     )
     return SourceRead.model_validate(source)
 
@@ -144,5 +150,7 @@ async def block_source(
     SourceBlockRequest and again in the service layer) and is always
     retained in the audit trail alongside the status change, atomically."""
     service = SourceRegistryService(session)
-    source = await service.block_source(source_id=source_id, reason=payload.reason, actor_id=actor)
+    source = await service.block_source(
+        source_id=source_id, reason=payload.reason, actor_id=actor, actor_type="api_key"
+    )
     return SourceRead.model_validate(source)

@@ -8,15 +8,29 @@ from datetime import datetime
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from de_ai_kb.domain.enums import (
-    AccessPolicy,
     FreshnessState,
-    RightsStatus,
     SourceStatus,
     SourceTier,
 )
 
 
 class SourceCreate(BaseModel):
+    """Fields a caller may set at registration time.
+
+    ``status``, ``rights_status``, and ``access_policy`` are deliberately
+    absent: every newly created source always starts at
+    status=registered/rights_status=needs_review/access_policy=metadata_only
+    (enforced in SourceRegistryService.create_source, not just here) — those
+    governed fields can only change afterwards through
+    ``POST /api/v1/sources/{id}/transition``,
+    ``POST /api/v1/sources/{id}/block``, and
+    ``POST /api/v1/review-items/{id}/rights-decision``. ``extra="forbid"``
+    makes an attempt to set a removed or unknown field fail with 422 rather
+    than being silently ignored.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
     source_key: str = Field(min_length=1)
     title: str = Field(min_length=1)
     publisher: str = Field(min_length=1)
@@ -27,8 +41,6 @@ class SourceCreate(BaseModel):
     geography_codes: list[str] = Field(default_factory=list)
     jurisdiction_codes: list[str] = Field(default_factory=list)
     topic_tags: list[str] = Field(default_factory=list)
-    access_policy: AccessPolicy = AccessPolicy.METADATA_ONLY
-    rights_status: RightsStatus = RightsStatus.NEEDS_REVIEW
     refresh_interval_days: int = Field(default=90, gt=0)
     notes: str | None = None
 
@@ -58,10 +70,27 @@ class SourceUpdate(BaseModel):
 
 
 class SourceTransitionRequest(BaseModel):
+    """The generic lifecycle-transition request. ``new_status=blocked`` is
+    rejected here: blocking is a takedown, not an ordinary lifecycle step,
+    and must go through ``POST /api/v1/sources/{id}/block`` (or the
+    ``sources block`` CLI command), which makes the reason mandatory rather
+    than merely optional. The service layer enforces this independently too
+    — see SourceRegistryService.transition_status."""
+
     model_config = ConfigDict(extra="forbid")
 
     new_status: SourceStatus
     reason: str | None = None
+
+    @field_validator("new_status")
+    @classmethod
+    def _new_status_not_blocked(cls, v: SourceStatus) -> SourceStatus:
+        if v == SourceStatus.BLOCKED:
+            raise ValueError(
+                "new_status=blocked is not allowed via /transition; "
+                "use POST /api/v1/sources/{id}/block instead"
+            )
+        return v
 
 
 class SourceBlockRequest(BaseModel):

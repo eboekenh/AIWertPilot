@@ -19,9 +19,11 @@ from de_ai_kb.domain.enums import (
     REVIEW_ITEM_STATUS_TRANSITIONS,
     REVIEW_TYPE_CONTENT,
     REVIEW_TYPE_RIGHTS,
+    SOURCE_STATUS_TRANSITIONS,
     AccessPolicy,
     ReviewItemStatus,
     RightsStatus,
+    SourceStatus,
     TdmOptOutStatus,
 )
 from de_ai_kb.domain.rights_policy import validate_rights_resolution
@@ -111,6 +113,26 @@ class ReviewService:
         )
         return item
 
+    async def is_rights_review_approved(self, *, source_id: uuid.UUID) -> bool:
+        """Whether the source's rights_review item has been approved (via
+        resolve_rights_review). Used by SourceRegistryService to gate status
+        transitions — see SOURCE_STATUS_TRANSITIONS callers."""
+        return await self._repo.has_status(
+            entity_type="source",
+            entity_id=source_id,
+            review_type=REVIEW_TYPE_RIGHTS,
+            status=ReviewItemStatus.APPROVED.value,
+        )
+
+    async def is_content_review_approved(self, *, source_id: uuid.UUID) -> bool:
+        """Whether the source's content_review item has been approved."""
+        return await self._repo.has_status(
+            entity_type="source",
+            entity_id=source_id,
+            review_type=REVIEW_TYPE_CONTENT,
+            status=ReviewItemStatus.APPROVED.value,
+        )
+
     async def decide(
         self,
         *,
@@ -191,6 +213,12 @@ class ReviewService:
         rights/access combination or an invalid state transition leaves
         both the review item and the source completely untouched.
         """
+        if not decision_reason.strip():
+            raise ValidationFailedError(
+                "a non-blank decision_reason is required to resolve a rights_review",
+                details={"review_item_id": str(review_item_id)},
+            )
+
         item = await self._repo.get_by_id(review_item_id)
         if item is None:
             raise NotFoundError(f"review_item {review_item_id} not found")
@@ -199,6 +227,13 @@ class ReviewService:
             raise ValidationFailedError(
                 f"review_item {review_item_id} is not a rights_review item "
                 f"(review_type={item.review_type!r})",
+                details={"review_item_id": str(review_item_id)},
+            )
+
+        if item.entity_type != "source":
+            raise ValidationFailedError(
+                f"review_item {review_item_id} does not belong to a source "
+                f"(entity_type={item.entity_type!r})",
                 details={"review_item_id": str(review_item_id)},
             )
 
@@ -242,7 +277,38 @@ class ReviewService:
         if licence_url is not None:
             source.licence_url = licence_url
 
+        # A rights outcome of blocked/blocked is a takedown, not merely a
+        # policy note: the source's lifecycle status must move to BLOCKED in
+        # the same transaction, or a fetch/publish could race ahead of a
+        # rights decision that already forbids it. Only auto-transition when
+        # the current status can legally reach BLOCKED (it already can from
+        # any live state); a source that is already blocked or in a terminal
+        # state (rejected/superseded/archived) is left as-is.
+        blocked_status_before = source.status
+        auto_blocked = False
+        if rights_status == RightsStatus.BLOCKED and access_policy == AccessPolicy.BLOCKED:
+            current_source_status = SourceStatus(source.status)
+            if current_source_status != SourceStatus.BLOCKED and SourceStatus.BLOCKED in (
+                SOURCE_STATUS_TRANSITIONS.get(current_source_status, set())
+            ):
+                source.status = SourceStatus.BLOCKED.value
+                auto_blocked = True
+
         await self._session.flush()
+
+        if auto_blocked:
+            self._audit.record(
+                actor_type="system",
+                actor_id=actor_id,
+                action="source.status_transition",
+                entity_type="source",
+                entity_id=source.id,
+                before_state={"status": blocked_status_before},
+                after_state={
+                    "status": source.status,
+                    "reason": "auto-blocked: rights review resolved to blocked/blocked",
+                },
+            )
 
         self._audit.record(
             actor_type="api_key",

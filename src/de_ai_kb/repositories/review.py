@@ -42,6 +42,21 @@ class ReviewItemRepository:
         )
         return result.scalar_one_or_none()
 
+    async def has_status(
+        self, *, entity_type: str, entity_id: uuid.UUID, review_type: str, status: str
+    ) -> bool:
+        result = await self._session.execute(
+            select(ReviewItem.id)
+            .where(
+                ReviewItem.entity_type == entity_type,
+                ReviewItem.entity_id == entity_id,
+                ReviewItem.review_type == review_type,
+                ReviewItem.status == status,
+            )
+            .limit(1)
+        )
+        return result.scalar_one_or_none() is not None
+
     def _apply_filters(self, stmt: Select[Any], filters: ReviewItemFilters) -> Select[Any]:
         if filters.status:
             stmt = stmt.where(ReviewItem.status == filters.status)
@@ -58,9 +73,7 @@ class ReviewItemRepository:
         count_stmt = self._apply_filters(select(func.count()).select_from(ReviewItem), filters)
         total = (await self._session.execute(count_stmt)).scalar_one()
         result = await self._session.execute(
-            base_stmt.order_by(
-                ReviewItem.priority, ReviewItem.created_at
-            ).limit(limit).offset(offset)
+            base_stmt.order_by(ReviewItem.priority, ReviewItem.created_at).limit(limit).offset(offset)
         )
         return list(result.scalars().all()), total
 

@@ -7,10 +7,17 @@ still decide.
 
 ## What the code enforces today
 
-- **Conservative defaults.** `sources.access_policy` defaults to
-  `metadata_only` and `rights_status` defaults to `needs_review` on every
-  path that creates a source (`SourceRegistryService.create_source`, the
-  seed importer, the API). Nothing defaults to `full_text_allowed`.
+- **Conservative defaults, not overridable at creation.**
+  `sources.access_policy` is always `metadata_only` and `rights_status` is
+  always `needs_review` on every path that creates a source
+  (`SourceRegistryService.create_source`, the seed importer, the API) —
+  these are hardcoded in the service, not caller-supplied defaults.
+  `SourceCreate` has no `status`/`rights_status`/`access_policy` fields
+  (`extra="forbid"` turns an attempt to set them into a `422`), and
+  `create_source()` has no parameters for them either, so there is no code
+  path — API, CLI/seed-import, or a future direct service call — that can
+  register a source that starts out published, reviewed, or full-text
+  allowed. Nothing defaults to `full_text_allowed`.
 - **No bypass of access controls.** `src/de_ai_kb/ingestion/fetcher.py` is
   an interface only — there is no code in this release that fetches a URL,
   so there is nothing that could bypass robots.txt, auth, or a paywall.
@@ -31,16 +38,43 @@ still decide.
   state-transition path as any other status change — the reason lands in
   `audit_events.after_state`, never silently discarded.
 - **Lifecycle and rights fields are not editable through the generic PATCH
-  route.** `PATCH /api/v1/sources/{id}` only edits metadata (`title`,
-  `publisher`, `tier`, `topic_tags`, `refresh_interval_days`, `notes`).
-  `status`, `rights_status`, and `access_policy` can only change through
+  route, or through re-importing the seed CSV.** `PATCH /api/v1/sources/{id}`
+  only edits metadata (`title`, `publisher`, `tier`, `topic_tags`,
+  `refresh_interval_days`, `notes`). `status`, `rights_status`, and
+  `access_policy` can only change through
   `POST /api/v1/sources/{id}/transition`,
   `POST /api/v1/sources/{id}/block`, and
   `POST /api/v1/review-items/{id}/rights-decision` respectively.
   `SourceRegistryService.update_source()` enforces an explicit allowlist of
   editable fields itself (`EDITABLE_SOURCE_FIELDS`), so this protection
   holds even for a direct service call that bypasses the API/Pydantic
-  layer entirely — not just for HTTP requests.
+  layer entirely — not just for HTTP requests. The seed importer uses a
+  separate, wider allowlist (`update_source_from_seed()` /
+  `SEED_UPDATABLE_FIELDS`) that also covers `source_type`, `language_code`,
+  `geography_codes`, and the URL pair, so a corrected CSV re-import isn't
+  silently rejected — but it excludes the same rights/lifecycle fields for
+  the same reason: a CSV's `access_policy` column is discovery-level
+  metadata only and is never diffed or applied to an existing source, so a
+  completed rights review can never be silently overwritten by a
+  re-import. A URL change is canonicalized and checked for a
+  `(canonical_url, publisher)` conflict before being applied, exactly as
+  at creation time.
+- **`/transition` cannot be used to block a source, and blocking always
+  requires a reason.** `SourceTransitionRequest` rejects
+  `new_status="blocked"` (`422`), and the `sources transition` CLI command
+  rejects `--status blocked` (exit code 1) — both point the caller at
+  `POST /api/v1/sources/{id}/block` / `sources block` instead. The service
+  layer (`SourceRegistryService.transition_status()`) independently
+  rejects any transition to `blocked` that lacks a non-blank `reason`,
+  regardless of entry point.
+- **A source cannot reach `fetched`/`approved`/`published` without
+  completing its review items.** See "Review gates on status transitions"
+  in `docs/RESEARCH_WORKFLOW.md` — `fetched` requires an approved,
+  non-blocked `rights_review`; `approved`/`published` additionally require
+  an approved `content_review`; and a rights decision that resolves to
+  `blocked`/`blocked` atomically blocks the source's lifecycle status too,
+  so a source can never be rights-blocked while still nominally
+  progressing toward publication.
 - **No personal data collected.** The domain model has no field for
   contact details, and nothing in this release ingests or stores personal
   data — `organizations`/`training_providers` model companies, not

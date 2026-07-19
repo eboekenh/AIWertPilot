@@ -254,12 +254,21 @@ def sources_transition(
     actor: Annotated[str, typer.Option(help="Actor id recorded in audit events")] = "cli",
 ) -> None:
     """Transition a source's lifecycle status. The only supported way to
-    change status — invalid transitions are rejected."""
+    change status, except for blocked — use `sources block` instead, which
+    makes the reason mandatory rather than merely optional. Invalid
+    transitions are rejected."""
     try:
         target_status = SourceStatus(status)
     except ValueError as exc:
         console.print(f"[red]invalid_status: {exc}[/red]")
         raise typer.Exit(code=1) from exc
+
+    if target_status == SourceStatus.BLOCKED:
+        console.print(
+            "[red]invalid_status: use `sources block <identifier> --reason ...` "
+            "to block a source, not `sources transition --status blocked`.[/red]"
+        )
+        raise typer.Exit(code=1)
 
     async def _transition() -> Source:
         settings = get_settings()
@@ -268,7 +277,11 @@ def sources_transition(
             service = SourceRegistryService(session)
             source_id = await _resolve_source_id(service, identifier)
             return await service.transition_status(
-                source_id=source_id, new_status=target_status, reason=reason, actor_id=actor
+                source_id=source_id,
+                new_status=target_status,
+                reason=reason,
+                actor_id=actor,
+                actor_type="cli",
             )
 
     try:
@@ -295,7 +308,9 @@ def sources_block(
         async with session_factory() as session, session.begin():
             service = SourceRegistryService(session)
             source_id = await _resolve_source_id(service, identifier)
-            return await service.block_source(source_id=source_id, reason=reason, actor_id=actor)
+            return await service.block_source(
+                source_id=source_id, reason=reason, actor_id=actor, actor_type="cli"
+            )
 
     try:
         source = _run(_block())

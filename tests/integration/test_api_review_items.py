@@ -134,6 +134,51 @@ async def test_rights_decision_endpoint_requires_api_key(api_client: AsyncClient
     assert response.status_code == 401
 
 
+async def test_rights_decision_endpoint_rejects_blank_decision_reason(
+    api_client: AsyncClient, dev_api_key: str
+) -> None:
+    source = await _create_source(api_client, dev_api_key, source_key="RIGHTS_BLANK_REASON_TEST")
+    items = await _review_items_for(api_client, source["id"])
+    rights_item = next(i for i in items if i["review_type"] == "rights_review")
+
+    response = await api_client.post(
+        f"/api/v1/review-items/{rights_item['id']}/rights-decision",
+        json={
+            "rights_status": "reviewed_allowed",
+            "access_policy": "short_evidence",
+            "decision_reason": "   ",
+        },
+        headers={"X-API-Key": dev_api_key},
+    )
+    assert response.status_code == 422
+
+    get_response = await api_client.get(f"/api/v1/sources/{source['id']}")
+    assert get_response.json()["rights_status"] == "needs_review"
+
+
+async def test_rights_decision_blocked_outcome_auto_blocks_source(
+    api_client: AsyncClient, dev_api_key: str
+) -> None:
+    source = await _create_source(api_client, dev_api_key, source_key="RIGHTS_AUTO_BLOCK_TEST")
+    items = await _review_items_for(api_client, source["id"])
+    rights_item = next(i for i in items if i["review_type"] == "rights_review")
+
+    response = await api_client.post(
+        f"/api/v1/review-items/{rights_item['id']}/rights-decision",
+        json={
+            "rights_status": "blocked",
+            "access_policy": "blocked",
+            "decision_reason": "publisher revoked permission",
+        },
+        headers={"X-API-Key": dev_api_key},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["source"]["status"] == "blocked"
+
+    get_response = await api_client.get(f"/api/v1/sources/{source['id']}")
+    assert get_response.json()["status"] == "blocked"
+
+
 async def test_list_review_items_filter_by_status(api_client: AsyncClient, dev_api_key: str) -> None:
     source = await _create_source(api_client, dev_api_key)
     items = await _review_items_for(api_client, source["id"])

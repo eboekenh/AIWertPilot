@@ -1,3 +1,5 @@
+import uuid
+
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -236,6 +238,7 @@ async def test_source_creation_records_audit_event(db_session: AsyncSession) -> 
         tier="A",
         refresh_interval_days=90,
         actor_id="test",
+        actor_type="api_key",
     )
     await db_session.commit()
 
@@ -259,6 +262,7 @@ async def test_create_source_creates_exactly_two_standard_review_items(db_sessio
         tier="A",
         refresh_interval_days=90,
         actor_id="test",
+        actor_type="api_key",
     )
     await db_session.commit()
 
@@ -268,3 +272,61 @@ async def test_create_source_creates_exactly_two_standard_review_items(db_sessio
     assert len(matching) == 2
     assert {i.review_type for i in matching} == {REVIEW_TYPE_RIGHTS, REVIEW_TYPE_CONTENT}
     assert all(i.status == ReviewItemStatus.OPEN.value for i in matching)
+
+
+async def test_resolve_rights_review_rejects_blank_decision_reason(db_session: AsyncSession) -> None:
+    source = await _make_source(db_session)
+    service = ReviewService(db_session)
+    items = await service.create_standard_source_review_items(source_id=source.id, actor_id="test")
+    await db_session.commit()
+    item = _item_by_type(items, REVIEW_TYPE_RIGHTS)
+
+    with pytest.raises(ValidationFailedError):
+        await service.resolve_rights_review(
+            review_item_id=item.id,
+            rights_status=RightsStatus.REVIEWED_ALLOWED,
+            access_policy=AccessPolicy.SHORT_EVIDENCE,
+            decision_reason="   ",
+            tdm_opt_out_status=None,
+            licence_name=None,
+            licence_url=None,
+            actor_id="test",
+        )
+
+    unchanged_item = await ReviewItemRepository(db_session).get_by_id(item.id)
+    assert unchanged_item is not None
+    assert unchanged_item.status == ReviewItemStatus.OPEN.value
+    unchanged_source = await SourceRepository(db_session).get_by_id(source.id)
+    assert unchanged_source is not None
+    assert unchanged_source.rights_status == RightsStatus.NEEDS_REVIEW.value
+
+
+async def test_resolve_rights_review_rejects_non_source_entity_type(db_session: AsyncSession) -> None:
+    """A rights_review item that (incorrectly) points at a non-source entity
+    must be rejected outright, and must change neither the review item nor
+    any source."""
+    from de_ai_kb.db.models.ops import ReviewItem
+
+    repo = ReviewItemRepository(db_session)
+    stray_item = ReviewItem(entity_type="document", entity_id=uuid.uuid4(), review_type=REVIEW_TYPE_RIGHTS)
+    repo.add(stray_item)
+    await db_session.flush()
+    await db_session.commit()
+
+    service = ReviewService(db_session)
+    with pytest.raises(ValidationFailedError):
+        await service.resolve_rights_review(
+            review_item_id=stray_item.id,
+            rights_status=RightsStatus.REVIEWED_ALLOWED,
+            access_policy=AccessPolicy.SHORT_EVIDENCE,
+            decision_reason="should not apply",
+            tdm_opt_out_status=None,
+            licence_name=None,
+            licence_url=None,
+            actor_id="test",
+        )
+
+    unchanged_item = await repo.get_by_id(stray_item.id)
+    assert unchanged_item is not None
+    assert unchanged_item.status == ReviewItemStatus.OPEN.value
+    assert unchanged_item.decision_reason is None

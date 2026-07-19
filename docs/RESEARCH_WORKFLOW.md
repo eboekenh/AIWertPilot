@@ -23,11 +23,17 @@ discover -> register -> rights review -> [fetch -> parse -> extract -> deduplica
 2. **Register.** `de-ai-kb sources import --file data/seed_sources.csv`
    or `POST /api/v1/sources` creates a `sources` row with
    `status='registered'`. Registration means "candidate known," never
-   "content verified" (master prompt §11) — the `access_policy` default is
-   `metadata_only` and `rights_status` defaults to `needs_review` unless
-   explicitly overridden. Both entry points call the same
+   "content verified" (master prompt §11) — every newly created source
+   **always** starts at `access_policy='metadata_only'` and
+   `rights_status='needs_review'`, with no way for a caller to override
+   this at creation time: `SourceCreate` has no `status`/`rights_status`/
+   `access_policy` fields at all (`extra="forbid"` rejects an attempt to
+   send them with `422`), and `SourceRegistryService.create_source()` has
+   no parameters for them either — the governed defaults are hardcoded in
+   the service, not merely defaulted. Both entry points call the same
    `SourceRegistryService.create_source`, which is the single place the
-   next step is guaranteed — no caller can register a source without it.
+   next step is guaranteed — no caller can register a source without it,
+   and none can register one that starts pre-approved.
 3. **Rights review + content review.** Every newly registered source, from
    any entry point, gets exactly two open `review_items` in the same
    transaction as its insert: `review_type='rights_review'` and
@@ -61,7 +67,36 @@ discover -> register -> rights review -> [fetch -> parse -> extract -> deduplica
    `refresh_interval_days`, `notes`); attempting to include a lifecycle or
    rights field in a `PATCH` body now returns `422`. A takedown/block uses
    `POST /api/v1/sources/{id}/block` (or `de-ai-kb sources block`), which
-   requires a non-blank `reason`.
+   requires a non-blank `reason`. `/transition` (and the `sources
+   transition` CLI command) refuse `new_status=blocked` outright — request
+   or request-schema validation rejects it with `422` (CLI: exit code 1) —
+   so blocking always goes through `/block`, which is the only path that
+   makes the reason mandatory rather than merely optional; the service
+   layer enforces the same non-blank-reason rule for any BLOCKED
+   transition a second time, independent of which entry point is used.
+7. **Review gates on status transitions.** `SourceRegistryService.
+   transition_status()` will not let a source advance past `registered`
+   until the review workflow has actually been completed — not just
+   *started*:
+   - **`fetched`** requires the source's `rights_review` item to be
+     `approved` (via `rights-decision`, never the generic decision
+     endpoint) **and** the resulting `rights_status` to be a valid,
+     non-blocked outcome (`reviewed_allowed` or `reviewed_restricted`).
+   - **`approved`** and **`published`** both additionally require the
+     `content_review` item to be `approved`. `published` re-runs the full
+     check rather than trusting the earlier `approved` transition, so
+     nothing between those two steps can silently invalidate the source's
+     review state without being caught.
+   - A rights decision that resolves to `rights_status='blocked'` **and**
+     `access_policy='blocked'` doesn't just record that outcome — it also
+     moves `sources.status` to `blocked` in the same transaction (both
+     changes share one `audit_events` entry set), so a source can never be
+     "rights-blocked but lifecycle-still-registered." Once blocked, the
+     allowed-transition table (`SOURCE_STATUS_TRANSITIONS`) only permits
+     `blocked → archived`, so a blocked source cannot be fetched or
+     published by any path.
+   - Any of these gate failures raises `ValidationFailedError` (`422`),
+     with a message naming the missing requirement.
 
 ### Rights review resolution
 
@@ -83,12 +118,30 @@ POST /api/v1/review-items/{id}/rights-decision
 The `rights_status`/`access_policy` pair is validated
 (`domain/rights_policy.py`) before anything is written: `blocked` may only
 pair with `access_policy="blocked"`, and `reviewed_restricted` may never
-pair with `full_text_allowed`. The review-item decision and the source's
-rights fields are updated atomically in one transaction — if the
-combination is invalid, or the review item isn't an open/in-progress
-`rights_review`, **neither record changes**. Both the review-item decision
-and the source policy change are recorded as separate `audit_events` rows
-in that same transaction.
+pair with `full_text_allowed`. `decision_reason` must be non-blank
+(whitespace-only is rejected at both the request-schema and service
+layer), and the review item must both be an open/in-progress
+`rights_review` **and** belong to a source (`entity_type="source"`) — a
+malformed or misrouted review item is rejected before any write. The
+review-item decision and the source's rights fields are updated atomically
+in one transaction — if any of these checks fail, **neither record
+changes**. Both the review-item decision and the source policy change are
+recorded as separate `audit_events` rows in that same transaction; a
+blocked/blocked outcome additionally records a third `audit_events` row
+for the resulting `source.status_transition` to `blocked` (see "Review
+gates on status transitions" above).
+
+### Audit provenance (`actor_type`)
+
+Every audited mutation in `SourceRegistryService` (`create_source`,
+`update_source`, `transition_status`, `block_source`) takes an explicit
+`actor_type` parameter from its caller — it is never inferred from the
+literal `actor_id` string. `POST /api/v1/sources*` routes always pass
+`actor_type="api_key"`; the CLI (`sources import`, `sources transition`,
+`sources block`) always passes `actor_type="cli"`. This means an operator
+who runs `sources transition --actor alice` is correctly audited as a
+`cli` actor named `alice`, not misclassified as an API caller because
+their chosen `--actor` value happens not to be the literal string `"cli"`.
 
 ## What remains a human/future-release responsibility
 

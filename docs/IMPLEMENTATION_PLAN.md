@@ -122,6 +122,66 @@ CSV importer did. Phase 1 closes both:
   generic decision endpoint now rejects an attempt to approve a
   `rights_review` item with `422`.
 
+## Foundation Hardening Release 1.1 — Phase 1 corrections
+
+A second independent review of Phase 1's own implementation found that
+several governance bypasses remained even after the changes above. These
+corrections close them, on the same branch/PR:
+
+- **Creation-time bypass closed.** `SourceCreate` no longer accepts
+  `status`/`rights_status`/`access_policy` (`extra="forbid"`), and
+  `SourceRegistryService.create_source()` no longer has parameters for
+  them either — every new source is hardcoded to
+  `status=registered`/`rights_status=needs_review`/
+  `access_policy=metadata_only` in the service itself, not merely
+  defaulted. Phase 1 had only locked this down for `PATCH`-time edits, not
+  creation-time.
+- **`/transition` can no longer reach `blocked`.**
+  `SourceTransitionRequest` rejects `new_status="blocked"` (`422`), and
+  `sources transition --status blocked` is rejected by the CLI before any
+  DB access (exit code 1) — both direct the caller to `/block` /
+  `sources block`, which is the only path that makes the reason mandatory.
+  `SourceRegistryService.transition_status()` also independently rejects
+  any BLOCKED transition without a non-blank reason, so this holds for a
+  direct service call too, not just the two officially-supported entry
+  points.
+- **Review gates now actually gate.** Phase 1 fixed *how* rights get
+  recorded but not *whether* a transition should be allowed based on
+  review completion — a caller could still walk
+  `registered → fetched → extracted → under_review → approved → published`
+  without ever resolving either review item.
+  `SourceRegistryService.transition_status()` now requires an approved,
+  non-blocked `rights_review` to reach `fetched`, and both an approved
+  `rights_review` and `content_review` to reach `approved`/`published`
+  (`published` re-checks rather than trusting the earlier `approved`
+  transition). A rights decision that resolves to `blocked`/`blocked` now
+  also atomically blocks the source's lifecycle status, and the
+  allowed-transition table already prevents a blocked source from
+  reaching `fetched` or `published`.
+- **`SeedImportService` dry-run/real-import consistency fixed.**
+  `_diff_fields()` could produce fields (`source_type`, `language_code`,
+  `geography_codes`, `original_url`, `canonical_url`) that the generic
+  `update_source()` allowlist rejected, so a dry-run "would update"
+  prediction could disagree with what a real import actually did. A new
+  `update_source_from_seed()` / `SEED_UPDATABLE_FIELDS` allowlist on
+  `SourceRegistryService` — wider than the API-facing one, but still
+  excluding rights/lifecycle fields — is now used by the real-import path,
+  and the dry-run path gained the same duplicate-conflict pre-check the
+  real path already raised on, so both paths agree in all cases including
+  URL changes and canonical-URL conflicts.
+- **Rights decisions hardened.** `RightsReviewDecisionRequest.
+  decision_reason` now rejects whitespace-only values (not just empty),
+  and `ReviewService.resolve_rights_review()` independently re-checks the
+  same rule plus `review_item.entity_type == "source"` before writing
+  anything — a malformed or misrouted review item changes neither record.
+- **Audit provenance fixed.** `create_source`/`update_source`/
+  `transition_status`/`block_source` all now take an explicit
+  `actor_type` parameter from their caller instead of inferring it by
+  comparing the literal `actor_id` string to `"cli"` (which broke for any
+  CLI caller using a custom `--actor` value). API routes pass
+  `actor_type="api_key"`; the CLI and the seed importer pass
+  `actor_type="cli"`.
+
 See `docs/RESEARCH_WORKFLOW.md` and `docs/RIGHTS_AND_CONTENT_POLICY.md`
 for the updated workflow, and the PR description for the full verification
 report this phase was scoped from. Deliberately out of scope for this

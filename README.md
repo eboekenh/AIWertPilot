@@ -81,10 +81,10 @@ uv run de-ai-kb claims validate --file data/seed_claims.csv
 |---|---|---|
 | `GET /health` | Liveness check | none |
 | `GET /api/v1/sources` | List/filter sources (tier, type, topic, publisher, language, status, freshness) | none |
-| `POST /api/v1/sources` | Register a new source (also creates its 2 standard review items) | `X-API-Key` |
+| `POST /api/v1/sources` | Register a new source (also creates its 2 standard review items); always starts `status=registered`/`rights_status=needs_review`/`access_policy=metadata_only` — those fields cannot be set at creation, unknown/protected fields return `422` | `X-API-Key` |
 | `GET /api/v1/sources/{id}` | Fetch one source | none |
 | `PATCH /api/v1/sources/{id}` | Edit generic metadata only (`title`, `publisher`, `tier`, `topic_tags`, `refresh_interval_days`, `notes`) — cannot change `status`, `rights_status`, or `access_policy`; unknown/protected fields return `422` | `X-API-Key` |
-| `POST /api/v1/sources/{id}/transition` | Change lifecycle `status`; invalid transitions return `409` | `X-API-Key` |
+| `POST /api/v1/sources/{id}/transition` | Change lifecycle `status`; invalid transitions return `409`; rejects `new_status=blocked` (`422`, use `/block`); `fetched`/`approved`/`published` require the matching review items to be approved first (`422` if not) | `X-API-Key` |
 | `POST /api/v1/sources/{id}/block` | Takedown/block; a non-blank `reason` is mandatory | `X-API-Key` |
 | `GET /api/v1/research/freshness` | Freshness report | none |
 | `GET /api/v1/review-items` | List/filter review items | none |
