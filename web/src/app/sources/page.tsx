@@ -40,6 +40,14 @@ export default async function SourcesPage() {
         </div>
       </details>
 
+      {sourcesResult.truncated ? (
+        <p className="mb-4 rounded-lg border border-amber-300 bg-amber-50 p-3 text-xs text-amber-800 dark:border-amber-800 dark:bg-amber-950/40 dark:text-amber-200">
+          Hinweis: Es werden nur die ersten {sourcesResult.items.length} von {sourcesResult.total} Quellen
+          geladen. Suche, Filter und Kennzahlen auf dieser Seite beziehen sich nur auf diese geladene
+          Teilmenge. Details siehe web/README.md.
+        </p>
+      ) : null}
+
       {sourcesResult.total === 0 ? (
         <EmptyState
           title="Noch keine Quellen registriert"

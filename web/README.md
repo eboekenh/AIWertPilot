@@ -69,8 +69,8 @@ loads `.env.local` automatically; it is git-ignored.
 | Variable | Purpose | Default |
 |---|---|---|
 | `NEXT_PUBLIC_API_BASE_URL` | Backend base URL, no trailing slash. Public — used by server-side data fetches, which run server-to-server and never expose this beyond "which API to call". | `http://localhost:8000` |
-| `NEXT_PUBLIC_ENABLE_DEV_WRITES` | Set to exactly `true` to show write controls (create source, transition, block, rights/review decisions). **Never set this against a shared or production backend.** | `false` |
-| `DEV_API_KEY` | The backend's development `X-API-Key`. **Not** prefixed with `NEXT_PUBLIC_` — read only by server-side Server Actions (`src/lib/api/actions.ts`), never sent to or bundled into the browser. Only needed when `NEXT_PUBLIC_ENABLE_DEV_WRITES=true`. | `change-me-dev-key` |
+| `ENABLE_DEV_WRITES` | Set to exactly `true` to show write controls (create source, transition, block, rights/review decisions). **Not** prefixed with `NEXT_PUBLIC_` — only ever read server-side (Server Components/Server Actions), so it never needs to reach the browser bundle. **Never set this against a shared or production backend.** | `false` |
+| `DEV_API_KEY` | The backend's development `X-API-Key`. **Not** prefixed with `NEXT_PUBLIC_` — read only by server-side Server Actions (`src/lib/api/actions.ts`), never sent to or bundled into the browser. Only needed when `ENABLE_DEV_WRITES=true`. Left as the shipped placeholder (`change-me-dev-key`), every write action fails closed with a configuration error instead of using it. | `change-me-dev-key` |
 
 ### Backend (relevant to this frontend — see `../.env.example` for the full list)
 
@@ -96,14 +96,30 @@ loads `.env.local` automatically; it is git-ignored.
   runs on the Next.js server, attaches the backend's `X-API-Key` header
   from `process.env.DEV_API_KEY`, and forwards the request. The API key is
   never sent to, or present in, the browser bundle. Every action
-  independently re-checks `NEXT_PUBLIC_ENABLE_DEV_WRITES` server-side
+  independently re-checks `ENABLE_DEV_WRITES` server-side
   (`isDevWritesEnabled()`) — hiding the button client-side is not treated
   as the security boundary, since a Server Action is itself a callable
   endpoint.
+- Every write action's argument is treated as **untrusted runtime input**,
+  not just as the TypeScript type in its signature — TS types are erased
+  at build time and are not a runtime boundary against a request built
+  outside this app's own UI. `src/lib/api/validate.ts` re-validates and
+  explicitly reconstructs each payload (allowlisting exactly the fields
+  the backend contract accepts) before it is ever forwarded; a forbidden
+  or malformed field is rejected locally without making a backend
+  request. This never duplicates the backend's own *business-rule*
+  validation (the status-transition table, rights/access-policy
+  consistency) — only shape/type/enum-membership — so the backend remains
+  the sole authority on whether a well-formed request is actually valid.
+- If writes are enabled but `DEV_API_KEY` is missing, blank, or still the
+  shipped placeholder (`change-me-dev-key`), every write action fails
+  closed with a `configuration_error` `ActionResult` and makes **no**
+  backend request — there is no fallback value.
 - Every write action returns a typed `ActionResult<T>`
   (`{ ok: true, data } | { ok: false, error }`) instead of throwing, so a
   rejected write (a backend validation error, a disabled dev-writes flag,
-  a network failure) is always renderable inline, never an uncaught
+  a missing/placeholder API key, a locally-rejected malformed input, a
+  network failure) is always renderable inline, never an uncaught
   exception.
 
 ## Development-only write controls
@@ -114,9 +130,12 @@ default**. To enable them locally:
 
 ```bash
 # web/.env.local
-NEXT_PUBLIC_ENABLE_DEV_WRITES=true
-DEV_API_KEY=<same value as the backend's .env DEV_API_KEY>
+ENABLE_DEV_WRITES=true
+DEV_API_KEY=<same real value as the backend's .env DEV_API_KEY>
 ```
+
+`DEV_API_KEY` must be a real value — the shipped placeholder
+(`change-me-dev-key`) is explicitly rejected at runtime (see above).
 
 Restart `npm run dev` after changing this. With it enabled:
 

@@ -29,7 +29,7 @@ function splitList(raw: string): string[] {
  */
 export function SourceCreateForm() {
   const router = useRouter();
-  const { execute, isPending, result } = useActionResult<SourceRead>();
+  const { execute, isPending, result, reset } = useActionResult<SourceRead>();
   const [formKey, setFormKey] = useState(0);
 
   function handleSubmit(event: FormEvent<HTMLFormElement>) {
@@ -71,7 +71,13 @@ export function SourceCreateForm() {
           </button>
           <button
             type="button"
-            onClick={() => setFormKey((k) => k + 1)}
+            onClick={() => {
+              // reset() clears the stored ActionResult — without it,
+              // `result?.ok` below stays true forever and this success
+              // view would never give way back to an empty form.
+              reset();
+              setFormKey((k) => k + 1);
+            }}
             className="text-sm font-medium text-slate-600 underline dark:text-slate-300"
           >
             Weitere Quelle anlegen

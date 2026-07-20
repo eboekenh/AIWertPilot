@@ -8,8 +8,6 @@ import { FormField } from "@/components/ui/FormField";
 import { inputClass, primaryButtonClass } from "@/components/ui/formClasses";
 import { resolveRightsReview } from "@/lib/api/actions";
 import {
-  ACCESS_POLICIES,
-  RIGHTS_STATUSES,
   TDM_OPT_OUT_STATUSES,
   type AccessPolicy,
   type ReviewItemRead,
@@ -18,19 +16,46 @@ import {
   type TdmOptOutStatus,
 } from "@/lib/api/types";
 import { ACCESS_POLICY_META, RIGHTS_STATUS_META, metaOrFallback } from "@/lib/enums";
+import { COMPLETED_RIGHTS_STATUSES, allowedAccessPoliciesFor } from "@/lib/transitions";
 import { useActionResult } from "@/lib/useActionResult";
+
+const DEFAULT_RIGHTS_STATUS = COMPLETED_RIGHTS_STATUSES[0];
+const DEFAULT_ACCESS_POLICY = allowedAccessPoliciesFor(DEFAULT_RIGHTS_STATUS)[0];
 
 /**
  * Approves a rights_review item with an explicit reviewed outcome
  * (POST /api/v1/review-items/{id}/rights-decision) — the only way to
- * approve a rights_review on the backend. This form does not pre-validate
- * which rights_status/access_policy combinations are consistent
- * (domain/rights_policy.py on the backend is the sole authority there); an
- * invalid combination is rejected by the backend and shown via ActionError.
+ * approve a rights_review on the backend.
+ *
+ * rights_status and access_policy are controlled here (not read from
+ * FormData like the rest of the form) so that changing rights_status
+ * always re-narrows the access_policy options to
+ * domain/rights_policy.py's allowed pairs and resets the selection to a
+ * valid one — an inconsistent combination can never be selected through
+ * this UI, by construction, not just by chance. This still does not
+ * replace the backend's own validation: the backend re-checks the pair
+ * independently and remains the sole authority (see lib/transitions.ts).
+ * "needs_review" is never offered as an outcome — it means "not yet
+ * reviewed", never a completed decision.
  */
 export function RightsDecisionForm({ reviewItem }: { reviewItem: ReviewItemRead }) {
   const { execute, isPending, result } = useActionResult<RightsReviewDecisionResult>();
   const [showOptional, setShowOptional] = useState(false);
+  const [rightsStatus, setRightsStatus] = useState<Exclude<RightsStatus, "needs_review">>(DEFAULT_RIGHTS_STATUS);
+  const [accessPolicy, setAccessPolicy] = useState<AccessPolicy>(DEFAULT_ACCESS_POLICY);
+
+  const accessPolicyOptions = allowedAccessPoliciesFor(rightsStatus);
+
+  function handleRightsStatusChange(next: string) {
+    const nextStatus = next as Exclude<RightsStatus, "needs_review">;
+    setRightsStatus(nextStatus);
+    // Always land on a valid pair for the new rights_status — never leave
+    // a combination selected that domain/rights_policy.py would reject.
+    const nextOptions = allowedAccessPoliciesFor(nextStatus);
+    if (!nextOptions.includes(accessPolicy)) {
+      setAccessPolicy(nextOptions[0]);
+    }
+  }
 
   function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -41,8 +66,8 @@ export function RightsDecisionForm({ reviewItem }: { reviewItem: ReviewItemRead 
 
     execute(() =>
       resolveRightsReview(reviewItem.id, {
-        rights_status: String(form.get("rights_status")) as RightsStatus,
-        access_policy: String(form.get("access_policy")) as AccessPolicy,
+        rights_status: rightsStatus,
+        access_policy: accessPolicy,
         decision_reason: String(form.get("decision_reason") ?? "").trim(),
         tdm_opt_out_status: tdmValue ? (tdmValue as TdmOptOutStatus) : null,
         licence_name: licenceName || null,
@@ -64,8 +89,15 @@ export function RightsDecisionForm({ reviewItem }: { reviewItem: ReviewItemRead 
     <form onSubmit={handleSubmit} className="space-y-3" aria-label="Rechteentscheidung">
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
         <FormField label="Rechtestatus" htmlFor="rights-status">
-          <select id="rights-status" name="rights_status" required className={inputClass}>
-            {RIGHTS_STATUSES.map((status) => (
+          <select
+            id="rights-status"
+            name="rights_status"
+            required
+            value={rightsStatus}
+            onChange={(event) => handleRightsStatusChange(event.target.value)}
+            className={inputClass}
+          >
+            {COMPLETED_RIGHTS_STATUSES.map((status) => (
               <option key={status} value={status}>
                 {metaOrFallback(RIGHTS_STATUS_META, status).label}
               </option>
@@ -73,8 +105,15 @@ export function RightsDecisionForm({ reviewItem }: { reviewItem: ReviewItemRead 
           </select>
         </FormField>
         <FormField label="Zugriffsrichtlinie" htmlFor="rights-access-policy">
-          <select id="rights-access-policy" name="access_policy" required className={inputClass}>
-            {ACCESS_POLICIES.map((policy) => (
+          <select
+            id="rights-access-policy"
+            name="access_policy"
+            required
+            value={accessPolicy}
+            onChange={(event) => setAccessPolicy(event.target.value as AccessPolicy)}
+            className={inputClass}
+          >
+            {accessPolicyOptions.map((policy) => (
               <option key={policy} value={policy}>
                 {metaOrFallback(ACCESS_POLICY_META, policy).label}
               </option>

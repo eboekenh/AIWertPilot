@@ -12,10 +12,9 @@ import { ApiError } from "@/lib/api/client";
 import { listAllReviewItems } from "@/lib/api/reviewItems";
 import { listAllSourcesForStats } from "@/lib/api/sources";
 import type { ReviewItemRead, SourceRead } from "@/lib/api/types";
+import { isOpenReviewItemStatus } from "@/lib/reviewStatus";
 
 export const dynamic = "force-dynamic";
-
-const OPEN_REVIEW_STATUSES = new Set(["open", "in_progress", "needs_changes"]);
 
 function SourceRow({ source, openItems }: { source: SourceRead; openItems: ReviewItemRead[] }) {
   return (
@@ -66,7 +65,7 @@ export default async function ReviewWorkspacePage() {
   }
 
   const sourceById = new Map(sourcesResult.items.map((source) => [source.id, source]));
-  const openItems = openReviewItemsResult.items.filter((item) => OPEN_REVIEW_STATUSES.has(item.status));
+  const openItems = openReviewItemsResult.items.filter((item) => isOpenReviewItemStatus(item.status));
 
   const openItemsBySource = new Map<string, ReviewItemRead[]>();
   for (const item of openItems) {
@@ -97,6 +96,21 @@ export default async function ReviewWorkspacePage() {
         title="Prüfung"
         description="Quellen, die noch eine Entscheidung benötigen. Die eigentliche Entscheidung wird auf der jeweiligen Quellenseite getroffen — diese Übersicht ändert nichts am Backend-Status selbst."
       />
+
+      {sourcesResult.truncated || openReviewItemsResult.truncated ? (
+        <p className="mb-6 rounded-lg border border-amber-300 bg-amber-50 p-3 text-xs text-amber-800 dark:border-amber-800 dark:bg-amber-950/40 dark:text-amber-200">
+          Hinweis:{" "}
+          {sourcesResult.truncated
+            ? `Es werden nur die ersten ${sourcesResult.items.length} von ${sourcesResult.total} Quellen`
+            : null}
+          {sourcesResult.truncated && openReviewItemsResult.truncated ? " und " : null}
+          {openReviewItemsResult.truncated
+            ? `nur die ersten ${openReviewItemsResult.items.length} von ${openReviewItemsResult.total} Prüfaufgaben`
+            : null}{" "}
+          geladen — bei sehr vielen Datensätzen werden nicht alle für diese Übersicht berücksichtigt.
+          Details siehe web/README.md.
+        </p>
+      ) : null}
 
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
         <Stat label="Offene Rechteprüfungen" value={openRightsCount} />

@@ -6,23 +6,14 @@ import { ActionError } from "@/components/ui/ActionError";
 import { FormField } from "@/components/ui/FormField";
 import { inputClass, primaryButtonClass } from "@/components/ui/formClasses";
 import { transitionSource } from "@/lib/api/actions";
-import { SOURCE_STATUSES, type SourceRead, type SourceStatus } from "@/lib/api/types";
+import type { SourceRead, SourceStatus } from "@/lib/api/types";
 import { SOURCE_STATUS_META, metaOrFallback } from "@/lib/enums";
+import { allowedTransitionTargets } from "@/lib/transitions";
 import { useActionResult } from "@/lib/useActionResult";
-
-/** SOURCE_STATUSES minus "blocked" (blocking is a dedicated, separately
- * audited workflow — see SourceBlockDialog) and minus the source's current
- * status. The backend independently rejects new_status="blocked" here and
- * remains the sole authority on which transitions are actually valid from
- * the current status; this form does not reproduce that transition table,
- * it just avoids offering the one status that can never be sent here. */
-function transitionableStatuses(current: string): SourceStatus[] {
-  return SOURCE_STATUSES.filter((status) => status !== "blocked" && status !== current);
-}
 
 export function SourceTransitionForm({ source }: { source: SourceRead }) {
   const { execute, isPending, result } = useActionResult<SourceRead>();
-  const options = transitionableStatuses(source.status);
+  const options = allowedTransitionTargets(source.status);
 
   function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -31,6 +22,15 @@ export function SourceTransitionForm({ source }: { source: SourceRead }) {
     const reason = String(form.get("reason") ?? "").trim();
 
     execute(() => transitionSource(source.id, { new_status: newStatus, reason: reason || null }));
+  }
+
+  if (options.length === 0) {
+    return (
+      <p className="text-sm text-slate-500 dark:text-slate-400">
+        Aus dem aktuellen Status (&quot;{metaOrFallback(SOURCE_STATUS_META, source.status).label}&quot;) sind
+        keine weiteren Statusübergänge möglich.
+      </p>
+    );
   }
 
   return (

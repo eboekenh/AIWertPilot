@@ -6,24 +6,24 @@ import { ActionError } from "@/components/ui/ActionError";
 import { FormField } from "@/components/ui/FormField";
 import { inputClass, primaryButtonClass } from "@/components/ui/formClasses";
 import { decideReviewItem } from "@/lib/api/actions";
-import { REVIEW_ITEM_STATUSES, REVIEW_TYPE_RIGHTS, type ReviewItemRead, type ReviewItemStatus } from "@/lib/api/types";
+import type { ReviewItemRead, ReviewItemStatus } from "@/lib/api/types";
 import { REVIEW_ITEM_STATUS_META, metaOrFallback } from "@/lib/enums";
+import { allowedReviewDecisionTargets } from "@/lib/transitions";
 import { useActionResult } from "@/lib/useActionResult";
 
 /**
  * Generic review decision (POST /api/v1/review-items/{id}/decision) — used
  * for content_review, dedup_candidate, and non-approval outcomes of a
- * rights_review. For a rights_review item, "approved" is left out of the
- * options as a UI convenience pointing the user at the dedicated
- * rights-decision form (RightsDecisionForm) instead; the backend enforces
- * this rejection itself regardless of what this form offers.
+ * rights_review. Options are the backend's REVIEW_ITEM_STATUS_TRANSITIONS
+ * for the item's current status; for a rights_review item, "approved" is
+ * additionally left out, pointing the user at the dedicated
+ * rights-decision form (RightsDecisionForm) instead. The backend enforces
+ * both the transition and the rights_review/approved rejection itself
+ * regardless of what this form offers.
  */
 export function ReviewDecisionForm({ reviewItem }: { reviewItem: ReviewItemRead }) {
   const { execute, isPending, result } = useActionResult<ReviewItemRead>();
-  const options =
-    reviewItem.review_type === REVIEW_TYPE_RIGHTS
-      ? REVIEW_ITEM_STATUSES.filter((status) => status !== "approved")
-      : REVIEW_ITEM_STATUSES;
+  const options = allowedReviewDecisionTargets(reviewItem.status, reviewItem.review_type);
 
   function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -42,6 +42,14 @@ export function ReviewDecisionForm({ reviewItem }: { reviewItem: ReviewItemRead 
     return (
       <p className="text-sm font-medium text-emerald-700 dark:text-emerald-300">
         Entscheidung gespeichert: {metaOrFallback(REVIEW_ITEM_STATUS_META, result.data.status).label}.
+      </p>
+    );
+  }
+
+  if (options.length === 0) {
+    return (
+      <p className="text-sm text-slate-500 dark:text-slate-400">
+        Aus dem aktuellen Status sind keine weiteren Entscheidungen möglich.
       </p>
     );
   }

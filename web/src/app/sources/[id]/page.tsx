@@ -60,12 +60,22 @@ export default async function SourceDetailPage({ params }: { params: Promise<{ i
     );
   }
 
-  const [reviewItemsResult, freshnessItems] = await Promise.all([
-    listAllReviewItems({ entity_type: "source" }),
-    getFreshnessReport(),
-  ]);
-  const reviewItems = reviewItemsResult.items.filter((item) => item.entity_id === source.id);
-  const freshness = freshnessItems.find((item) => item.source_id === source.id);
+  let reviewItems: Awaited<ReturnType<typeof listAllReviewItems>>["items"] = [];
+  let freshness: Awaited<ReturnType<typeof getFreshnessReport>>[number] | undefined;
+  let reviewSectionError: string | null = null;
+  try {
+    const [reviewItemsResult, freshnessItems] = await Promise.all([
+      listAllReviewItems({ entity_type: "source" }),
+      getFreshnessReport(),
+    ]);
+    reviewItems = reviewItemsResult.items.filter((item) => item.entity_id === source.id);
+    freshness = freshnessItems.find((item) => item.source_id === source.id);
+  } catch (error) {
+    reviewSectionError =
+      error instanceof ApiError
+        ? error.message
+        : "Unbekannter Fehler beim Laden der Prüfaufgaben und Aktualitätsdaten.";
+  }
 
   return (
     <>
@@ -128,7 +138,11 @@ export default async function SourceDetailPage({ params }: { params: Promise<{ i
           <Card>
             <h2 className="text-sm font-semibold text-slate-900 dark:text-slate-100">Prüfaufgaben</h2>
             <div className="mt-4">
-              <ReviewActionPanel reviewItems={reviewItems} devWritesEnabled={devWritesEnabled} />
+              {reviewSectionError ? (
+                <ErrorState message={reviewSectionError} />
+              ) : (
+                <ReviewActionPanel reviewItems={reviewItems} devWritesEnabled={devWritesEnabled} />
+              )}
             </div>
           </Card>
 

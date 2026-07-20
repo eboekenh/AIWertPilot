@@ -13,6 +13,7 @@ import { ApiError } from "@/lib/api/client";
 import { listAllReviewItems } from "@/lib/api/reviewItems";
 import { getFreshnessReport, listAllSourcesForStats } from "@/lib/api/sources";
 import { formatDateTime } from "@/lib/format";
+import { isOpenReviewItemStatus } from "@/lib/reviewStatus";
 
 export const dynamic = "force-dynamic";
 
@@ -25,7 +26,10 @@ export default async function DashboardPage() {
     [sourcesResult, freshnessItems, openReviewItems] = await Promise.all([
       listAllSourcesForStats(),
       getFreshnessReport(),
-      listAllReviewItems({ entity_type: "source", status: "open" }),
+      // No status filter: "needs review" must count open, in_progress, AND
+      // needs_changes items (see lib/reviewStatus.ts) — filtered below,
+      // consistently with the review workspace.
+      listAllReviewItems({ entity_type: "source" }),
     ]);
   } catch (error) {
     const message =
@@ -64,11 +68,14 @@ export default async function DashboardPage() {
 
   const blockedCount = statusCounts.blocked ?? 0;
   const publishedCount = statusCounts.published ?? 0;
-  const sourcesNeedingReview = new Set(openReviewItems.items.map((item) => item.entity_id)).size;
+  const openReviewItemsList = openReviewItems.items.filter((item) => isOpenReviewItemStatus(item.status));
+  const sourcesNeedingReview = new Set(openReviewItemsList.map((item) => item.entity_id)).size;
 
   const recentlyUpdated = [...items]
     .sort((a, b) => b.updated_at.localeCompare(a.updated_at))
     .slice(0, 8);
+
+  const reviewItemsTruncated = openReviewItems.truncated;
 
   return (
     <>
@@ -77,10 +84,18 @@ export default async function DashboardPage() {
         description={`Kennzahlen aus ${total} registrierten Quellen.`}
       />
 
-      {truncated ? (
+      {truncated || reviewItemsTruncated ? (
         <p className="mb-6 rounded-lg border border-amber-300 bg-amber-50 p-3 text-xs text-amber-800 dark:border-amber-800 dark:bg-amber-950/40 dark:text-amber-200">
-          Hinweis: Diese Kennzahlen basieren auf den ersten {items.length} von {total} Quellen — bei sehr
-          vielen Quellen werden nicht alle für die Übersicht geladen. Details siehe web/README.md.
+          Hinweis:{" "}
+          {truncated
+            ? `Diese Kennzahlen basieren auf den ersten ${items.length} von ${total} Quellen`
+            : null}
+          {truncated && reviewItemsTruncated ? " und " : null}
+          {reviewItemsTruncated
+            ? `auf den ersten ${openReviewItems.items.length} von ${openReviewItems.total} Prüfaufgaben`
+            : null}{" "}
+          — bei sehr vielen Datensätzen werden nicht alle für die Übersicht geladen. Details siehe
+          web/README.md.
         </p>
       ) : null}
 
