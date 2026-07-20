@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import csv
+import uuid
 from collections.abc import Coroutine
 from pathlib import Path
 from typing import Annotated, Any
@@ -15,13 +16,16 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from de_ai_kb.core.config import get_settings
+from de_ai_kb.core.exceptions import DomainError, NotFoundError
+from de_ai_kb.db.models.sources import Source
 from de_ai_kb.db.session import get_sessionmaker
-from de_ai_kb.domain.enums import FreshnessState
+from de_ai_kb.domain.enums import FreshnessState, SourceStatus
 from de_ai_kb.repositories.review import ReviewItemFilters, ReviewItemRepository
 from de_ai_kb.services.claims_validation import ClaimsValidationService, ClaimsValidationSummary
 from de_ai_kb.services.dedup import DuplicateDetectionService
 from de_ai_kb.services.freshness import FreshnessService
 from de_ai_kb.services.seed_import import SeedImportService, SeedImportSummary
+from de_ai_kb.services.source_registry import SourceRegistryService
 from de_ai_kb.services.taxonomy_seed import TaxonomySeedService
 
 app = typer.Typer(no_args_is_help=True, add_completion=False)
@@ -36,6 +40,7 @@ app.add_typer(claims_app, name="claims")
 
 console = Console()
 _REPO_ROOT = Path(__file__).resolve().parents[3]
+
 
 def _run[T](coro: Coroutine[Any, Any, T]) -> T:
     return asyncio.run(coro)
@@ -228,6 +233,94 @@ def sources_stale(
     console.print(f"[bold]{len(items)} source(s).[/bold]")
 
 
+async def _resolve_source_id(service: SourceRegistryService, identifier: str) -> uuid.UUID:
+    """Accept either a source_key or a UUID id, as documented for the
+    `sources transition`/`sources block` commands."""
+    try:
+        return uuid.UUID(identifier)
+    except ValueError:
+        pass
+    source = await service.get_by_source_key(identifier)
+    if source is None:
+        raise NotFoundError(f"no source found with source_key or id {identifier!r}")
+    return source.id
+
+
+@sources_app.command("transition")
+def sources_transition(
+    identifier: Annotated[str, typer.Argument(help="source_key or UUID id")],
+    status: Annotated[str, typer.Option("--status", help="target lifecycle status")],
+    reason: Annotated[str | None, typer.Option("--reason", help="recorded in the audit trail")] = None,
+    actor: Annotated[str, typer.Option(help="Actor id recorded in audit events")] = "cli",
+) -> None:
+    """Transition a source's lifecycle status. The only supported way to
+    change status, except for blocked — use `sources block` instead, which
+    makes the reason mandatory rather than merely optional. Invalid
+    transitions are rejected."""
+    try:
+        target_status = SourceStatus(status)
+    except ValueError as exc:
+        console.print(f"[red]invalid_status: {exc}[/red]")
+        raise typer.Exit(code=1) from exc
+
+    if target_status == SourceStatus.BLOCKED:
+        console.print(
+            "[red]invalid_status: use `sources block <identifier> --reason ...` "
+            "to block a source, not `sources transition --status blocked`.[/red]"
+        )
+        raise typer.Exit(code=1)
+
+    async def _transition() -> Source:
+        settings = get_settings()
+        session_factory = get_sessionmaker(settings.database_url)
+        async with session_factory() as session, session.begin():
+            service = SourceRegistryService(session)
+            source_id = await _resolve_source_id(service, identifier)
+            return await service.transition_status(
+                source_id=source_id,
+                new_status=target_status,
+                reason=reason,
+                actor_id=actor,
+                actor_type="cli",
+            )
+
+    try:
+        source = _run(_transition())
+    except DomainError as exc:
+        console.print(f"[red]{exc.code}: {exc.message}[/red]")
+        raise typer.Exit(code=1) from exc
+
+    console.print(f"[green]Source {source.source_key} transitioned to {source.status}.[/green]")
+
+
+@sources_app.command("block")
+def sources_block(
+    identifier: Annotated[str, typer.Argument(help="source_key or UUID id")],
+    reason: Annotated[str, typer.Option("--reason", help="mandatory, non-blank takedown reason")],
+    actor: Annotated[str, typer.Option(help="Actor id recorded in audit events")] = "cli",
+) -> None:
+    """Block (takedown) a source. A non-blank reason is mandatory and is
+    always recorded in the audit trail alongside the status change."""
+
+    async def _block() -> Source:
+        settings = get_settings()
+        session_factory = get_sessionmaker(settings.database_url)
+        async with session_factory() as session, session.begin():
+            service = SourceRegistryService(session)
+            source_id = await _resolve_source_id(service, identifier)
+            return await service.block_source(
+                source_id=source_id, reason=reason, actor_id=actor, actor_type="cli"
+            )
+
+    try:
+        source = _run(_block())
+    except DomainError as exc:
+        console.print(f"[red]{exc.code}: {exc.message}[/red]")
+        raise typer.Exit(code=1) from exc
+
+    console.print(f"[green]Source {source.source_key} blocked.[/green]")
+
+
 @review_app.command("export")
 def review_export(
     out: Annotated[Path, typer.Option(help="Output CSV path")] = Path("review_items_export.csv"),
@@ -250,8 +343,14 @@ def review_export(
         writer = csv.writer(fh)
         writer.writerow(
             [
-                "id", "entity_type", "entity_id", "review_type", "status",
-                "priority", "assigned_to", "created_at",
+                "id",
+                "entity_type",
+                "entity_id",
+                "review_type",
+                "status",
+                "priority",
+                "assigned_to",
+                "created_at",
             ]
         )
         for item in items:

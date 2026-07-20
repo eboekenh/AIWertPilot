@@ -12,6 +12,39 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 _REAL_SOURCES_CSV = _REPO_ROOT / "data" / "seed_sources.csv"
 _MALFORMED_CSV = _REPO_ROOT / "tests" / "fixtures" / "malformed_sources.csv"
 
+_HEADER = (
+    "source_key,title,publisher,source_type,tier,topics,geography,language,"
+    "url,access_policy,refresh_days,review_status,notes"
+)
+
+
+def _row(
+    *,
+    source_key: str = "CONSISTENCY_SOURCE",
+    title: str = "Consistency Source",
+    publisher: str = "Publisher A",
+    source_type: str = "official_statistics",
+    tier: str = "A",
+    topics: str = "adoption",
+    geography: str = "DE",
+    language: str = "de",
+    url: str = "https://example.com/consistency",
+    access_policy: str = "metadata_only",
+    refresh_days: str = "90",
+    review_status: str = "discovery_verified",
+    notes: str = "note",
+) -> str:
+    return (
+        f'"{source_key}","{title}","{publisher}","{source_type}","{tier}","{topics}",'
+        f'"{geography}","{language}","{url}","{access_policy}","{refresh_days}",'
+        f'"{review_status}","{notes}"'
+    )
+
+
+def _write_csv(path: Path, *rows: str) -> Path:
+    path.write_text(_HEADER + "\n" + "\n".join(rows) + "\n", encoding="utf-8")
+    return path
+
 
 async def test_malformed_rows_are_rejected_with_reasons(
     test_session_factory: async_sessionmaker[AsyncSession], clean_db: None
@@ -89,3 +122,197 @@ async def test_real_seed_sources_second_import_is_idempotent(
     assert second.updated == 0
     assert second.review_items_created == 0
     assert second.unchanged == first.inserted
+
+
+# --- Requirement 4: dry-run/real-import consistency for changed fields ------
+
+
+async def test_title_change_dry_run_and_real_import_agree(
+    test_session_factory: async_sessionmaker[AsyncSession], clean_db: None, tmp_path: Path
+) -> None:
+    service = SeedImportService(test_session_factory)
+    first_csv = _write_csv(tmp_path / "first.csv", _row(title="Original Title"))
+    await service.import_csv(first_csv, dry_run=False, actor_id="test")
+
+    changed_csv = _write_csv(tmp_path / "changed.csv", _row(title="Changed Title"))
+    dry_run = await service.import_csv(changed_csv, dry_run=True, actor_id="test")
+    assert dry_run.updated == 1
+    assert dry_run.rejected == 0
+
+    real_run = await service.import_csv(changed_csv, dry_run=False, actor_id="test")
+    assert real_run.updated == 1
+    assert real_run.rejected == 0
+
+    async with test_session_factory() as session:
+        source = await SourceRepository(session).get_by_source_key("CONSISTENCY_SOURCE")
+    assert source is not None
+    assert source.title == "Changed Title"
+
+    unchanged_dry_run = await service.import_csv(changed_csv, dry_run=True, actor_id="test")
+    assert unchanged_dry_run.unchanged == 1
+    assert unchanged_dry_run.updated == 0
+
+
+async def test_geography_change_dry_run_and_real_import_agree(
+    test_session_factory: async_sessionmaker[AsyncSession], clean_db: None, tmp_path: Path
+) -> None:
+    service = SeedImportService(test_session_factory)
+    first_csv = _write_csv(tmp_path / "first.csv", _row(geography="DE"))
+    await service.import_csv(first_csv, dry_run=False, actor_id="test")
+
+    changed_csv = _write_csv(tmp_path / "changed.csv", _row(geography="DE|EU"))
+    dry_run = await service.import_csv(changed_csv, dry_run=True, actor_id="test")
+    assert dry_run.updated == 1
+
+    real_run = await service.import_csv(changed_csv, dry_run=False, actor_id="test")
+    assert real_run.updated == 1
+    assert real_run.rejected == 0
+
+    async with test_session_factory() as session:
+        source = await SourceRepository(session).get_by_source_key("CONSISTENCY_SOURCE")
+    assert source is not None
+    assert sorted(source.geography_codes) == ["DE", "EU"]
+
+
+async def test_url_change_dry_run_and_real_import_agree(
+    test_session_factory: async_sessionmaker[AsyncSession], clean_db: None, tmp_path: Path
+) -> None:
+    service = SeedImportService(test_session_factory)
+    first_csv = _write_csv(tmp_path / "first.csv", _row(url="https://example.com/original-path"))
+    await service.import_csv(first_csv, dry_run=False, actor_id="test")
+
+    changed_csv = _write_csv(tmp_path / "changed.csv", _row(url="https://example.com/new-path"))
+    dry_run = await service.import_csv(changed_csv, dry_run=True, actor_id="test")
+    assert dry_run.updated == 1
+    assert dry_run.rejected == 0
+
+    real_run = await service.import_csv(changed_csv, dry_run=False, actor_id="test")
+    assert real_run.updated == 1
+    assert real_run.rejected == 0
+
+    async with test_session_factory() as session:
+        source = await SourceRepository(session).get_by_source_key("CONSISTENCY_SOURCE")
+    assert source is not None
+    assert source.original_url == "https://example.com/new-path"
+    assert source.canonical_url == "https://example.com/new-path"
+
+
+async def test_url_change_conflicting_with_another_source_is_rejected_consistently(
+    test_session_factory: async_sessionmaker[AsyncSession], clean_db: None, tmp_path: Path
+) -> None:
+    service = SeedImportService(test_session_factory)
+    initial_csv = _write_csv(
+        tmp_path / "initial.csv",
+        _row(source_key="SOURCE_A", url="https://example.com/a", publisher="Publisher A"),
+        _row(source_key="SOURCE_B", url="https://example.com/b", publisher="Publisher A"),
+    )
+    await service.import_csv(initial_csv, dry_run=False, actor_id="test")
+
+    conflicting_csv = _write_csv(
+        tmp_path / "conflicting.csv",
+        _row(source_key="SOURCE_A", url="https://example.com/b", publisher="Publisher A"),
+        _row(source_key="SOURCE_B", url="https://example.com/b", publisher="Publisher A"),
+    )
+    dry_run = await service.import_csv(conflicting_csv, dry_run=True, actor_id="test")
+    a_row = next(r for r in dry_run.rows if r.source_key == "SOURCE_A")
+    assert a_row.outcome == "rejected"
+
+    real_run = await service.import_csv(conflicting_csv, dry_run=False, actor_id="test")
+    a_real_row = next(r for r in real_run.rows if r.source_key == "SOURCE_A")
+    assert a_real_row.outcome == "rejected"
+
+    async with test_session_factory() as session:
+        source_a = await SourceRepository(session).get_by_source_key("SOURCE_A")
+    assert source_a is not None
+    assert source_a.original_url == "https://example.com/a"
+
+
+async def test_publisher_only_change_creating_url_publisher_conflict_is_rejected_consistently(
+    test_session_factory: async_sessionmaker[AsyncSession], clean_db: None, tmp_path: Path
+) -> None:
+    """Two sources already share a canonical_url under different
+    publishers (allowed — schema.sql's UNIQUE is on the pair, not the URL
+    alone). A seed update that changes only SOURCE_A's publisher to match
+    SOURCE_B's would collide with SOURCE_B's (canonical_url, publisher)
+    pair even though the URL itself never changes — this must be predicted
+    in dry-run and rejected cleanly (never a raw IntegrityError) in the
+    real import, leaving SOURCE_A's row untouched."""
+    service = SeedImportService(test_session_factory)
+    initial_csv = _write_csv(
+        tmp_path / "initial.csv",
+        _row(source_key="SOURCE_A", url="https://example.com/shared", publisher="Publisher A"),
+        _row(source_key="SOURCE_B", url="https://example.com/shared", publisher="Publisher B"),
+    )
+    await service.import_csv(initial_csv, dry_run=False, actor_id="test")
+
+    conflicting_csv = _write_csv(
+        tmp_path / "conflicting.csv",
+        _row(source_key="SOURCE_A", url="https://example.com/shared", publisher="Publisher B"),
+        _row(source_key="SOURCE_B", url="https://example.com/shared", publisher="Publisher B"),
+    )
+    dry_run = await service.import_csv(conflicting_csv, dry_run=True, actor_id="test")
+    a_dry_row = next(r for r in dry_run.rows if r.source_key == "SOURCE_A")
+    assert a_dry_row.outcome == "rejected"
+    assert a_dry_row.reason is not None and "Publisher B" in a_dry_row.reason
+
+    real_run = await service.import_csv(conflicting_csv, dry_run=False, actor_id="test")
+    a_real_row = next(r for r in real_run.rows if r.source_key == "SOURCE_A")
+    assert a_real_row.outcome == "rejected"
+    # A DomainError (DuplicateSourceError) always carries a human-readable
+    # .message, which RowResult.reason is populated from — proving the
+    # `except DomainError` branch handled this cleanly rather than a raw
+    # SQLAlchemy IntegrityError propagating out of import_csv().
+    assert a_real_row.reason is not None and "Publisher B" in a_real_row.reason
+    assert a_dry_row.reason == a_real_row.reason
+
+    async with test_session_factory() as session:
+        source_a = await SourceRepository(session).get_by_source_key("SOURCE_A")
+    assert source_a is not None
+    assert source_a.publisher == "Publisher A"
+    assert source_a.canonical_url == "https://example.com/shared"
+
+
+async def test_access_policy_csv_change_never_overwrites_a_completed_rights_review(
+    test_session_factory: async_sessionmaker[AsyncSession], clean_db: None, tmp_path: Path
+) -> None:
+    from de_ai_kb.domain.enums import AccessPolicy, RightsStatus
+    from de_ai_kb.repositories.review import ReviewItemFilters, ReviewItemRepository
+    from de_ai_kb.services.review import ReviewService
+
+    service = SeedImportService(test_session_factory)
+    first_csv = _write_csv(tmp_path / "first.csv", _row(access_policy="metadata_only"))
+    await service.import_csv(first_csv, dry_run=False, actor_id="test")
+
+    async with test_session_factory() as session:
+        source = await SourceRepository(session).get_by_source_key("CONSISTENCY_SOURCE")
+        assert source is not None
+        review_repo = ReviewItemRepository(session)
+        items = await review_repo.list_all(filters=ReviewItemFilters(entity_type="source"))
+        rights_item = next(i for i in items if i.entity_id == source.id and i.review_type == "rights_review")
+        review_service = ReviewService(session)
+        await review_service.resolve_rights_review(
+            review_item_id=rights_item.id,
+            rights_status=RightsStatus.REVIEWED_ALLOWED,
+            access_policy=AccessPolicy.SHORT_EVIDENCE,
+            decision_reason="publisher licence confirmed",
+            tdm_opt_out_status=None,
+            licence_name=None,
+            licence_url=None,
+            actor_id="test",
+        )
+        await session.commit()
+
+    # CSV re-import proposes a different access_policy for the same row.
+    changed_csv = _write_csv(tmp_path / "changed.csv", _row(access_policy="full_text_allowed"))
+    dry_run = await service.import_csv(changed_csv, dry_run=True, actor_id="test")
+    assert dry_run.unchanged == 1
+    assert dry_run.updated == 0
+
+    real_run = await service.import_csv(changed_csv, dry_run=False, actor_id="test")
+    assert real_run.unchanged == 1
+
+    async with test_session_factory() as session:
+        refreshed = await SourceRepository(session).get_by_source_key("CONSISTENCY_SOURCE")
+    assert refreshed is not None
+    assert refreshed.access_policy == AccessPolicy.SHORT_EVIDENCE.value
+    assert refreshed.rights_status == RightsStatus.REVIEWED_ALLOWED.value

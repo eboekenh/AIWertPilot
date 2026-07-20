@@ -75,6 +75,39 @@ uv run de-ai-kb sources import --file data/seed_sources.csv --dry-run
 uv run de-ai-kb claims validate --file data/seed_claims.csv
 ```
 
+## API endpoints
+
+| Method & path | Purpose | Auth |
+|---|---|---|
+| `GET /health` | Liveness check | none |
+| `GET /api/v1/sources` | List/filter sources (tier, type, topic, publisher, language, status, freshness) | none |
+| `POST /api/v1/sources` | Register a new source (also creates its 2 standard review items); always starts `status=registered`/`rights_status=needs_review`/`access_policy=metadata_only` — those fields cannot be set at creation, unknown/protected fields return `422` | `X-API-Key` |
+| `GET /api/v1/sources/{id}` | Fetch one source | none |
+| `PATCH /api/v1/sources/{id}` | Edit generic metadata only (`title`, `publisher`, `tier`, `topic_tags`, `refresh_interval_days`, `notes`) — cannot change `status`, `rights_status`, or `access_policy`; unknown/protected fields return `422` | `X-API-Key` |
+| `POST /api/v1/sources/{id}/transition` | Change lifecycle `status`; invalid transitions return `409`; rejects `new_status=blocked` (`422`, use `/block`); `fetched`/`approved`/`published` require the matching review items to be approved first (`422` if not) | `X-API-Key` |
+| `POST /api/v1/sources/{id}/block` | Takedown/block; a non-blank `reason` is mandatory | `X-API-Key` |
+| `GET /api/v1/research/freshness` | Freshness report | none |
+| `GET /api/v1/review-items` | List/filter review items | none |
+| `POST /api/v1/review-items/{id}/decision` | Generic decision for non-rights review items; rejects an attempt to approve a `rights_review` item | `X-API-Key` |
+| `POST /api/v1/review-items/{id}/rights-decision` | Approve a `rights_review` item with an explicit reviewed `rights_status`/`access_policy` (and optional `tdm_opt_out_status`/`licence_name`/`licence_url`), applied to the source atomically | `X-API-Key` |
+
+## CLI commands
+
+```bash
+uv run de-ai-kb db check|init|migrate|seed-taxonomy
+uv run de-ai-kb sources import --file data/seed_sources.csv [--dry-run]
+uv run de-ai-kb sources validate --file data/seed_sources.csv
+uv run de-ai-kb sources duplicates
+uv run de-ai-kb sources stale [--state fresh|due_soon|stale|unknown|all]
+uv run de-ai-kb sources transition <source-key-or-id> --status <status> [--reason <reason>]
+uv run de-ai-kb sources block <source-key-or-id> --reason <reason>
+uv run de-ai-kb review export --out review_items_export.csv
+uv run de-ai-kb claims validate --file data/seed_claims.csv
+```
+
+There is currently no CLI command for the rights-review resolution
+workflow — use `POST /api/v1/review-items/{id}/rights-decision`.
+
 ## Current limitations (Foundation Release 1)
 
 - No crawling/fetching implementation — `ingestion/` defines interfaces only.

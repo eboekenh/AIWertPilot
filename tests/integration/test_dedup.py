@@ -18,6 +18,7 @@ async def _seed_sources(session: AsyncSession) -> None:
         tier="A",
         refresh_interval_days=90,
         actor_id="test",
+        actor_type="api_key",
     )
     # near-duplicate title, same publisher
     await service.create_source(
@@ -29,6 +30,7 @@ async def _seed_sources(session: AsyncSession) -> None:
         tier="A",
         refresh_interval_days=90,
         actor_id="test",
+        actor_type="api_key",
     )
     # same canonical URL, different publisher label
     await service.create_source(
@@ -40,6 +42,7 @@ async def _seed_sources(session: AsyncSession) -> None:
         tier="A",
         refresh_interval_days=90,
         actor_id="test",
+        actor_type="api_key",
     )
     # unrelated source, should not match anything
     await service.create_source(
@@ -51,6 +54,7 @@ async def _seed_sources(session: AsyncSession) -> None:
         tier="C",
         refresh_interval_days=180,
         actor_id="test",
+        actor_type="api_key",
     )
     await session.commit()
 
@@ -82,9 +86,7 @@ async def test_dedup_scan_is_idempotent(db_session: AsyncSession) -> None:
     from de_ai_kb.repositories.review import ReviewItemFilters, ReviewItemRepository
 
     review_repo = ReviewItemRepository(db_session)
-    dedup_items = await review_repo.list_all(
-        filters=ReviewItemFilters(review_type="dedup_candidate")
-    )
+    dedup_items = await review_repo.list_all(filters=ReviewItemFilters(review_type="dedup_candidate"))
     # find_candidates still reports the same pairs on a re-scan (the
     # underlying source data hasn't changed), but no *additional*
     # review_items are created — the UNIQUE(entity_type, entity_id,

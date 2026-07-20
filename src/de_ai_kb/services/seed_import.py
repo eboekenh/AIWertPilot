@@ -16,10 +16,8 @@ from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from de_ai_kb.core.exceptions import DomainError
-from de_ai_kb.domain.enums import AccessPolicy, RightsStatus, SourceStatus
 from de_ai_kb.repositories.sources import SourceRepository
 from de_ai_kb.services.csv_rows import SeedSourceRow
-from de_ai_kb.services.review import ReviewService
 from de_ai_kb.services.source_registry import SourceRegistryService
 
 Outcome = Literal["inserted", "updated", "unchanged", "rejected"]
@@ -68,8 +66,14 @@ def _diff_fields(existing: Any, parsed: SeedSourceRow) -> dict[str, Any]:
         diff["topic_tags"] = parsed.topics
     if sorted(existing.geography_codes) != sorted(parsed.geography):
         diff["geography_codes"] = parsed.geography
-    if existing.access_policy != parsed.access_policy:
-        diff["access_policy"] = parsed.access_policy
+    # access_policy is deliberately NOT diffed here: it is a governed rights
+    # field (SourceRegistryService.update_source_from_seed excludes it, just
+    # as update_source does) that must change through an actual rights
+    # review — POST /api/v1/review-items/{id}/rights-decision — never by
+    # silently re-importing a CSV with a different value for an
+    # already-registered source. A changed CSV access_policy value for an
+    # existing source is simply not applied, and never overwrites a
+    # completed rights review.
     if existing.refresh_interval_days != parsed.refresh_days:
         diff["refresh_interval_days"] = parsed.refresh_days
     if existing.original_url != parsed.url:
@@ -79,6 +83,40 @@ def _diff_fields(existing: Any, parsed: SeedSourceRow) -> dict[str, Any]:
     if (existing.notes or "") != (parsed.notes or ""):
         diff["notes"] = parsed.notes
     return diff
+
+
+async def _predict_insert_conflict(repo: SourceRepository, parsed: SeedSourceRow) -> str | None:
+    """Mirror SourceRegistryService.create_source's duplicate check for a
+    row that would be a fresh insert, so a dry-run "inserted" prediction
+    never disagrees with what the real import actually does."""
+    existing_by_url = await repo.get_by_canonical_url(parsed.canonical_url)
+    conflict = [s for s in existing_by_url if s.publisher == parsed.publisher]
+    if conflict:
+        return f"canonical_url {parsed.canonical_url!r} already registered for publisher {parsed.publisher!r}"
+    return None
+
+
+async def _predict_update_conflict(repo: SourceRepository, existing: Any, diff: dict[str, Any]) -> str | None:
+    """Mirror SourceRegistryService.update_source_from_seed's duplicate
+    check, so a dry-run "updated" prediction never disagrees with what the
+    real import actually does. schema.sql's UNIQUE constraint is on the
+    (canonical_url, publisher) *pair*, so a conflict can be introduced by
+    changing either field alone — e.g. two sources already sharing a
+    canonical_url under different publishers, where a publisher-only edit
+    to one of them collides with the other. Must check the effective pair
+    whenever either field is in the diff, not only when canonical_url is."""
+    if "canonical_url" not in diff and "publisher" not in diff:
+        return None
+    effective_canonical_url = diff.get("canonical_url", existing.canonical_url)
+    effective_publisher = diff.get("publisher", existing.publisher)
+    candidates = await repo.get_by_canonical_url(effective_canonical_url)
+    conflict = [s for s in candidates if s.id != existing.id and s.publisher == effective_publisher]
+    if conflict:
+        return (
+            f"canonical_url {effective_canonical_url!r} already registered for "
+            f"publisher {effective_publisher!r}"
+        )
+    return None
 
 
 class SeedImportService:
@@ -93,17 +131,13 @@ class SeedImportService:
                 try:
                     row = SeedSourceRow.from_csv_row(raw_row)
                 except (ValidationError, ValueError) as exc:
-                    reason = (
-                        _format_validation_error(exc) if isinstance(exc, ValidationError) else str(exc)
-                    )
+                    reason = _format_validation_error(exc) if isinstance(exc, ValidationError) else str(exc)
                     parsed_rows.append((i, raw_row, None, reason))
                     continue
                 parsed_rows.append((i, raw_row, row, None))
         return parsed_rows
 
-    async def import_csv(
-        self, file_path: Path, *, dry_run: bool, actor_id: str
-    ) -> SeedImportSummary:
+    async def import_csv(self, file_path: Path, *, dry_run: bool, actor_id: str) -> SeedImportSummary:
         summary = SeedImportSummary(dry_run=dry_run)
         parsed_rows = self._parse_rows(file_path)
         summary.total_rows = len(parsed_rows)
@@ -112,9 +146,7 @@ class SeedImportService:
             source_key = (raw_row or {}).get("source_key", "") if raw_row else ""
             if parsed is None:
                 summary.rejected += 1
-                summary.rows.append(
-                    RowResult(row_number, source_key, "rejected", reason=reject_reason)
-                )
+                summary.rows.append(RowResult(row_number, source_key, "rejected", reason=reject_reason))
                 continue
 
             if dry_run:
@@ -122,16 +154,30 @@ class SeedImportService:
                     repo = SourceRepository(session)
                     existing = await repo.get_by_source_key(parsed.source_key)
                     if existing is None:
-                        summary.inserted += 1
-                        summary.rows.append(RowResult(row_number, parsed.source_key, "inserted"))
+                        conflict_reason = await _predict_insert_conflict(repo, parsed)
+                        if conflict_reason:
+                            summary.rejected += 1
+                            summary.rows.append(
+                                RowResult(row_number, parsed.source_key, "rejected", reason=conflict_reason)
+                            )
+                        else:
+                            summary.inserted += 1
+                            summary.rows.append(RowResult(row_number, parsed.source_key, "inserted"))
                     else:
                         diff = _diff_fields(existing, parsed)
-                        if diff:
-                            summary.updated += 1
-                            summary.rows.append(RowResult(row_number, parsed.source_key, "updated"))
-                        else:
+                        if not diff:
                             summary.unchanged += 1
                             summary.rows.append(RowResult(row_number, parsed.source_key, "unchanged"))
+                            continue
+                        conflict_reason = await _predict_update_conflict(repo, existing, diff)
+                        if conflict_reason:
+                            summary.rejected += 1
+                            summary.rows.append(
+                                RowResult(row_number, parsed.source_key, "rejected", reason=conflict_reason)
+                            )
+                        else:
+                            summary.updated += 1
+                            summary.rows.append(RowResult(row_number, parsed.source_key, "updated"))
                 continue
 
             try:
@@ -139,9 +185,22 @@ class SeedImportService:
                     repo = SourceRepository(session)
                     existing = await repo.get_by_source_key(parsed.source_key)
                     registry_service = SourceRegistryService(session)
-                    review_service = ReviewService(session)
 
                     if existing is None:
+                        # create_source() itself guarantees the two standard
+                        # review items (rights_review + content_review) in
+                        # the same transaction — see
+                        # SourceRegistryService.create_source. This is the
+                        # single place that invariant is enforced; the
+                        # importer does not duplicate it.
+                        # access_policy/rights_status/status are not passed
+                        # here — create_source() always starts a new source
+                        # at registered/needs_review/metadata_only regardless
+                        # of caller, per SourceRegistryService.create_source.
+                        # The CSV's access_policy column is discovery-level
+                        # metadata only; it never determines the actual
+                        # governed access_policy, which requires a real
+                        # rights review.
                         source = await registry_service.create_source(
                             source_key=parsed.source_key,
                             title=parsed.title,
@@ -152,28 +211,24 @@ class SeedImportService:
                             language_code=parsed.language,
                             geography_codes=parsed.geography,
                             topic_tags=parsed.topics,
-                            access_policy=AccessPolicy(parsed.access_policy),
-                            rights_status=RightsStatus.NEEDS_REVIEW,
                             refresh_interval_days=parsed.refresh_days,
                             notes=parsed.notes,
-                            status=SourceStatus.REGISTERED,
                             actor_id=actor_id,
-                        )
-                        created_items = await review_service.create_standard_source_review_items(
-                            source_id=source.id, actor_id=actor_id
+                            actor_type="cli",
                         )
                         summary.inserted += 1
-                        summary.review_items_created += len(created_items)
+                        summary.review_items_created += 2
                         summary.rows.append(
-                            RowResult(
-                                row_number, parsed.source_key, "inserted", source_id=str(source.id)
-                            )
+                            RowResult(row_number, parsed.source_key, "inserted", source_id=str(source.id))
                         )
                     else:
                         diff = _diff_fields(existing, parsed)
                         if diff:
-                            await registry_service.update_source(
-                                source_id=existing.id, updates=diff, actor_id=actor_id
+                            await registry_service.update_source_from_seed(
+                                source_id=existing.id,
+                                updates=diff,
+                                actor_id=actor_id,
+                                actor_type="cli",
                             )
                             summary.updated += 1
                             summary.rows.append(
@@ -185,14 +240,14 @@ class SeedImportService:
                             summary.unchanged += 1
                             summary.rows.append(
                                 RowResult(
-                                    row_number, parsed.source_key, "unchanged",
+                                    row_number,
+                                    parsed.source_key,
+                                    "unchanged",
                                     source_id=str(existing.id),
                                 )
                             )
             except DomainError as exc:
                 summary.rejected += 1
-                summary.rows.append(
-                    RowResult(row_number, parsed.source_key, "rejected", reason=exc.message)
-                )
+                summary.rows.append(RowResult(row_number, parsed.source_key, "rejected", reason=exc.message))
 
         return summary

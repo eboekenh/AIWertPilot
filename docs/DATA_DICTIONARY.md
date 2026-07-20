@@ -137,7 +137,14 @@ see `services/review.py::create_standard_source_review_items`), and
 per source at a time because of the `UNIQUE(entity_type, entity_id,
 review_type, status)` constraint). `status`
 (`open→in_progress→approved|rejected|needs_changes|cancelled`), transitions
-enforced by `domain/enums.REVIEW_ITEM_STATUS_TRANSITIONS`.
+enforced by `domain/enums.REVIEW_ITEM_STATUS_TRANSITIONS`. A `rights_review`
+item can only reach `approved` through
+`ReviewService.resolve_rights_review()` (`POST /api/v1/review-items/{id}/
+rights-decision`), which requires an explicit reviewed `rights_status`/
+`access_policy` pair and applies it to the source atomically; the generic
+decision path (`ReviewService.decide()`) rejects an approval attempt on a
+`rights_review` item so a source's rights fields can never change as an
+unintended side effect of an unrelated decision call.
 
 **Deviation:** `metadata jsonb NOT NULL DEFAULT '{}'` (migration `0002`,
 not in `schema.sql`). Holds only supplemental, non-searchable context for
