@@ -108,6 +108,16 @@ uv run de-ai-kb claims validate --file data/seed_claims.csv
 There is currently no CLI command for the rights-review resolution
 workflow — use `POST /api/v1/review-items/{id}/rights-decision`.
 
+## Frontend
+
+`web/` contains a Next.js internal evidence/source-review interface
+(Foundation Frontend Phase 1) that reads and writes through the real API
+endpoints above — a dashboard, filterable source list, source detail
+pages, and a review workspace. It is not the final AI recommendation
+product. See `web/README.md` for setup, environment variables (including
+the `CORS_ALLOWED_ORIGINS` backend setting it needs), and how
+development-only write controls are enabled.
+
 ## Current limitations (Foundation Release 1)
 
 - No crawling/fetching implementation — `ingestion/` defines interfaces only.
@@ -115,7 +125,8 @@ workflow — use `POST /api/v1/review-items/{id}/rights-decision`.
 - `seed_claims.csv` is validated but never imported into `claims`/
   `claim_evidence`; see `docs/NEXT_RELEASES.md` for the Release 2/3 import
   path.
-- No recommendation UI or frontend.
+- No recommendation UI — `web/` is an internal evidence/review interface
+  only (see "Frontend" above), not the final AI recommendation product.
 - Object storage ships a local-filesystem implementation only; the
   S3-compatible interface has no real S3/MinIO backend wired up yet.
 
